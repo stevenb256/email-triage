@@ -540,13 +540,19 @@ def _refresh_calendar():
         end = (now + timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
         candidates = ["outlook_calendar_list_events", "outlook_calendar_list", "calendar_list_events"]
         resp = None
+        # Try different argument names across MCP tool variants
         for tool in candidates:
-            try:
-                resp = call_tool(tool, {"start": start, "end": end, "top": 500})
-                if resp:
-                    break
-            except Exception:
-                resp = None
+            for argset in ({"start": start, "end": end, "top": 500},
+                           {"start_datetime": start, "end_datetime": end, "top": 500},
+                           {"startDateTime": start, "endDateTime": end, "top": 500}):
+                try:
+                    resp = call_tool(tool, argset)
+                    if resp:
+                        break
+                except Exception:
+                    resp = None
+            if resp:
+                break
         events = []
         if isinstance(resp, dict):
             if "events" in resp:
