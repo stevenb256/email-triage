@@ -94,9 +94,20 @@ def init_db():
         key     TEXT PRIMARY KEY,
         value   TEXT
     );
+    CREATE TABLE IF NOT EXISTS calendar_events (
+        id              TEXT PRIMARY KEY,
+        subject         TEXT,
+        start_time      TEXT,
+        end_time        TEXT,
+        location        TEXT,
+        attendees       TEXT,
+        raw_json        TEXT,
+        synced_at       TEXT
+    );
     CREATE INDEX IF NOT EXISTS idx_emails_conv_key ON emails(conversation_key);
     CREATE INDEX IF NOT EXISTS idx_threads_updated  ON threads(updated_at);
     CREATE INDEX IF NOT EXISTS idx_threads_urgency  ON threads(urgency);
+    CREATE INDEX IF NOT EXISTS idx_calendar_start ON calendar_events(start_time);
     """)
     db.commit()
     # Migrations: add columns if not present (idempotent)
@@ -520,9 +531,95 @@ def _refresh_folders() -> tuple:
         return json.loads(meta_get("efforts_subfolders", "[]")), json.loads(meta_get("other_folders", "[]"))
 
 
+def _refresh_calendar():
+    """Fetch upcoming calendar events and store them in the local DB. Stores a meta key 'next_meeting' with JSON for the soonest future event.
+    Tries a few likely MCP tool names for compatibility."""
+    try:
+        now = datetime.now(timezone.utc)
+        start = (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = (now + timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        candidates = ["outlook_calendar_list_events", "outlook_calendar_list", "calendar_list_events"]
+        resp = None
+        for tool in candidates:
+            try:
+                resp = call_tool(tool, {"start": start, "end": end, "top": 500})
+                if resp:
+                    break
+            except Exception:
+                resp = None
+        events = []
+        if isinstance(resp, dict):
+            if "events" in resp:
+                events = resp.get("events")
+            elif "value" in resp and isinstance(resp.get("value"), list):
+                events = resp.get("value")
+            else:
+                # maybe the resp itself is a single event or list
+                if isinstance(resp.get("items"), list):
+                    events = resp.get("items")
+        elif isinstance(resp, list):
+            events = resp
+
+        db = get_db()
+        now_iso = _utcnow()
+        for ev in events:
+            # Support different shapes for event objects
+            ev_id = ev.get("id") or ev.get("eventId") or ev.get("uid") or ''
+            subj = ev.get("subject") or ev.get("title") or ''
+            # Start / end may be nested objects
+            start_obj = ev.get("start") or ev.get("startDateTime") or ev.get("start_time") or {}
+            end_obj = ev.get("end") or ev.get("endDateTime") or ev.get("end_time") or {}
+            def _get_dt(o):
+                if isinstance(o, dict):
+                    return o.get("dateTime") or o.get("date") or o.get("date_time") or ''
+                return str(o or '')
+            start_time = _get_dt(start_obj)
+            end_time = _get_dt(end_obj)
+            location = ''
+            if isinstance(ev.get("location"), dict):
+                location = ev.get("location").get("displayName") or ev.get("location").get("address") or ''
+            else:
+                location = ev.get("location") or ev.get("place") or ''
+            attendees = []
+            for a in (ev.get("attendees") or ev.get("participants") or []):
+                if isinstance(a, dict):
+                    name = a.get("displayName") or a.get("name") or a.get("email") or a.get("address") or ''
+                    attendees.append(name)
+                else:
+                    attendees.append(str(a))
+            db.execute(
+                "INSERT OR REPLACE INTO calendar_events (id,subject,start_time,end_time,location,attendees,raw_json,synced_at) VALUES(?,?,?,?,?,?,?,?)",
+                (ev_id, subj, start_time, end_time, location, json.dumps(attendees), json.dumps(ev), now_iso)
+            )
+        db.commit()
+
+        # Compute next meeting
+        row = db.execute("SELECT id,subject,start_time,end_time,location,attendees FROM calendar_events WHERE start_time > ? ORDER BY start_time ASC LIMIT 1", (now.strftime("%Y-%m-%dT%H:%M:%SZ"),)).fetchone()
+        if row:
+            nm = {"id": row[0], "subject": row[1], "start_time": row[2], "end_time": row[3], "location": row[4], "attendees": json.loads(row[5] or "[]")}
+            meta_set("next_meeting", json.dumps(nm))
+            return nm
+        else:
+            meta_set("next_meeting", json.dumps({}))
+            return None
+    except Exception as e:
+        print(f"Warning: could not refresh calendar: {e}")
+        try:
+            return json.loads(meta_get("next_meeting", "{}") or "{}")
+        except Exception:
+            return None
+
+
 def _do_sync():
     _sync_status.update({"phase": "fetching", "progress": "Fetching folder list…", "done": 0, "total": 0})
     efforts, other = _refresh_folders()
+    try:
+        _sync_status["progress"] = "Refreshing calendar…"
+        nm = _refresh_calendar()
+        if nm:
+            _sync_status["nextMeeting"] = nm
+    except Exception as e:
+        print(f"  Calendar refresh failed: {e}")
 
     _sync_status["progress"] = "Fetching inbox messages…"
     msgs_result = call_tool("outlook_mail_list_messages", {"folder": "Inbox", "top": INBOX_FETCH})
@@ -697,12 +794,17 @@ def api_threads():
     result = [{"topic": k, "threads": groups[k]} for k in order]
     latest_ts = max((t["updatedAt"] for t in threads), default="")
 
+    try:
+        nm = json.loads(meta_get("next_meeting", "{}") or "{}")
+    except Exception:
+        nm = {}
     return jsonify({
         "groups": result,
         "latestTs": latest_ts,
         "threadCount": len(threads),
         "emailCount": db.execute("SELECT COUNT(*) FROM emails").fetchone()[0],
         "syncStatus": {**_sync_status},
+        "nextMeeting": nm,
     })
 
 
@@ -718,10 +820,15 @@ def api_updates():
     ).fetchall()
     threads = [_thread_to_dict(r) for r in rows]
     latest_ts = threads[-1]["updatedAt"] if threads else since
+    try:
+        nm = json.loads(meta_get("next_meeting", "{}") or "{}")
+    except Exception:
+        nm = {}
     return jsonify({
         "threads": threads,
         "latestTs": latest_ts,
         "syncStatus": {**_sync_status},
+        "nextMeeting": nm,
     })
 
 
@@ -1625,6 +1732,7 @@ select:focus{border-color:#58a6ff;}
     <div class="header-brand">
       <h1>✉ Email Triage</h1>
       <span id="email-count" class="badge-sm"></span>
+      <span id="next-meeting" class="badge-sm" style="margin-left:10px"></span>
     </div>
     <div class="header-center">
       <div class="sync-status">
@@ -1783,6 +1891,14 @@ async function init() {
   document.getElementById('empty-pane').style.display='flex';
   updateCounts(d.emailCount, Object.keys(state.threadMap).length);
   updateSyncStatus(d.syncStatus);
+  // Update next meeting display (if present)
+  try {
+    const nm = d.nextMeeting || {};
+    const nmEl = document.getElementById('next-meeting');
+    if (nm && nm.subject && nm.start_time) {
+      nmEl.textContent = `Next: ${esc(nm.subject)} · ${fmtDate((nm.start_time||'').slice(0,19))}`;
+    } else if (nmEl) { nmEl.textContent = ''; }
+  } catch(e) {}
   renderSidebar();
   schedulePoll();
 }
@@ -1796,6 +1912,14 @@ async function pollUpdates() {
   const d = await fetch(`/api/updates?since=${encodeURIComponent(state.latestTs)}`).then(r=>r.json()).catch(()=>null);
   if (!d) { schedulePoll(); return; }
   updateSyncStatus(d.syncStatus);
+  // Update next meeting display if present
+  try {
+    const nm = d.nextMeeting || {};
+    const nmEl = document.getElementById('next-meeting');
+    if (nm && nm.subject && nm.start_time) {
+      nmEl.textContent = `Next: ${esc(nm.subject)} · ${fmtDate((nm.start_time||'').slice(0,19))}`;
+    } else if (nmEl) { nmEl.textContent = ''; }
+  } catch(e) {}
   if (d.threads && d.threads.length>0) {
     let newCount=0;
     for (const t of d.threads) {
