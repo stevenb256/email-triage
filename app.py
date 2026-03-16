@@ -14,7 +14,7 @@ import sqlite3
 import threading
 import time
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import anthropic
 from flask import Flask, jsonify, render_template_string, request
@@ -25,7 +25,7 @@ from mcp.client.stdio import stdio_client
 
 MCP_COMMAND     = "/opt/homebrew/bin/McpOutlookLocal"
 DB_PATH         = os.path.join(os.path.dirname(__file__), "email_triage.db")
-PORT            = 5001
+PORT            = 5002
 SYNC_INTERVAL   = 300   # 5 minutes
 INBOX_FETCH     = 100
 ANALYSIS_MODEL  = "claude-haiku-4-5-20251001"
