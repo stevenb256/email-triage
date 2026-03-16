@@ -546,10 +546,13 @@ def _refresh_calendar():
                            {"start_datetime": start, "end_datetime": end, "top": 500},
                            {"startDateTime": start, "endDateTime": end, "top": 500}):
                 try:
+                    print(f"  Trying calendar tool {tool} with args: {argset}")
                     resp = call_tool(tool, argset)
+                    print(f"  -> resp for {tool}: {str(resp)[:200]}")
                     if resp:
                         break
-                except Exception:
+                except Exception as ex:
+                    print(f"  calendar tool {tool} failed: {ex}")
                     resp = None
             if resp:
                 break
