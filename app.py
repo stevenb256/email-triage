@@ -28,8 +28,14 @@ DB_PATH         = os.path.join(os.path.dirname(__file__), "email_triage.db")
 PORT            = 5002
 SYNC_INTERVAL   = 300   # 5 minutes
 INBOX_FETCH     = 100
+FOLDER_FETCH    = 100   # messages per non-inbox folder per sync cycle
 ANALYSIS_MODEL  = "claude-haiku-4-5-20251001"
 REPLY_MODEL     = "claude-sonnet-4-6"
+
+SKIP_SYNC_FOLDERS = {
+    "Drafts", "Outbox", "Junk Email",
+    "Conversation History", "RSS Feeds", "Sync Issues", "Scheduled", "Inbox", "",
+}
 
 _env_path = os.path.join(os.path.dirname(__file__), ".env")
 if os.path.exists(_env_path):
@@ -114,6 +120,7 @@ def init_db():
     for migration in [
         "ALTER TABLE emails ADD COLUMN formatted_body TEXT",
         "ALTER TABLE threads ADD COLUMN is_flagged INTEGER DEFAULT 0",
+        "ALTER TABLE emails ADD COLUMN folder TEXT",
     ]:
         try:
             db.execute(migration)
@@ -532,30 +539,35 @@ def _refresh_folders() -> tuple:
 
 
 def _refresh_calendar():
-    """Fetch upcoming calendar events and store them in the local DB. Stores a meta key 'next_meeting' with JSON for the soonest future event.
-    Tries a few likely MCP tool names for compatibility."""
+    """Fetch upcoming calendar events and store them in the local DB. Stores a meta key 'next_meeting' with JSON for the soonest future event."""
     try:
+        import time as _time
+        tz_name = _time.tzname[0] if _time.tzname else "UTC"
+        # Try to get a proper IANA timezone name
+        try:
+            import subprocess
+            result = subprocess.run(["readlink", "/etc/localtime"], capture_output=True, text=True)
+            if result.returncode == 0 and "zoneinfo/" in result.stdout:
+                tz_name = result.stdout.strip().split("zoneinfo/")[-1]
+        except Exception:
+            pass
+
         now = datetime.now(timezone.utc)
-        start = (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        end = (now + timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        candidates = ["outlook_calendar_list_events", "outlook_calendar_list", "calendar_list_events"]
+        # Format without Z suffix as required by the tool
+        start = (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
+        end = (now + timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%S")
         resp = None
-        # Try different argument names across MCP tool variants
-        for tool in candidates:
-            for argset in ({"start": start, "end": end, "top": 500},
-                           {"start_datetime": start, "end_datetime": end, "top": 500},
-                           {"startDateTime": start, "endDateTime": end, "top": 500}):
-                try:
-                    print(f"  Trying calendar tool {tool} with args: {argset}")
-                    resp = call_tool(tool, argset)
-                    print(f"  -> resp for {tool}: {str(resp)[:200]}")
-                    if resp:
-                        break
-                except Exception as ex:
-                    print(f"  calendar tool {tool} failed: {ex}")
-                    resp = None
-            if resp:
-                break
+        try:
+            print(f"  Calling outlook_calendar_list_events: start={start}, end={end}, tz={tz_name}")
+            resp = call_tool("outlook_calendar_list_events", {
+                "start_datetime": start,
+                "end_datetime": end,
+                "time_zone": tz_name,
+            })
+            print(f"  Calendar resp type={type(resp).__name__}: {str(resp)[:300]}")
+        except Exception as ex:
+            print(f"  calendar tool failed: {ex}")
+            resp = None
         events = []
         if isinstance(resp, dict):
             if "events" in resp:
@@ -571,28 +583,40 @@ def _refresh_calendar():
 
         db = get_db()
         now_iso = _utcnow()
+        def _ev_get(ev, *keys):
+            """Case-insensitive multi-key lookup for event dicts."""
+            for k in keys:
+                v = ev.get(k) or ev.get(k.lower()) or ev.get(k[0].upper() + k[1:]) or ev.get(k.upper())
+                if v:
+                    return v
+            return None
+
+        def _get_dt(o):
+            if isinstance(o, dict):
+                return (_ev_get(o, "dateTime", "DateTime") or
+                        _ev_get(o, "date", "Date") or
+                        _ev_get(o, "date_time") or '')
+            return str(o or '')
+
         for ev in events:
-            # Support different shapes for event objects
-            ev_id = ev.get("id") or ev.get("eventId") or ev.get("uid") or ''
-            subj = ev.get("subject") or ev.get("title") or ''
-            # Start / end may be nested objects
-            start_obj = ev.get("start") or ev.get("startDateTime") or ev.get("start_time") or {}
-            end_obj = ev.get("end") or ev.get("endDateTime") or ev.get("end_time") or {}
-            def _get_dt(o):
-                if isinstance(o, dict):
-                    return o.get("dateTime") or o.get("date") or o.get("date_time") or ''
-                return str(o or '')
+            ev_id = _ev_get(ev, "id", "Id", "eventId", "uid") or ''
+            subj = _ev_get(ev, "subject", "Subject", "title", "Title") or ''
+            start_obj = _ev_get(ev, "start", "Start", "startDateTime", "start_time") or {}
+            end_obj = _ev_get(ev, "end", "End", "endDateTime", "end_time") or {}
             start_time = _get_dt(start_obj)
             end_time = _get_dt(end_obj)
+            loc_raw = _ev_get(ev, "location", "Location", "place")
             location = ''
-            if isinstance(ev.get("location"), dict):
-                location = ev.get("location").get("displayName") or ev.get("location").get("address") or ''
+            if isinstance(loc_raw, dict):
+                location = (_ev_get(loc_raw, "displayName", "DisplayName") or
+                            _ev_get(loc_raw, "address", "Address") or '')
             else:
-                location = ev.get("location") or ev.get("place") or ''
+                location = str(loc_raw or '')
             attendees = []
-            for a in (ev.get("attendees") or ev.get("participants") or []):
+            for a in (_ev_get(ev, "attendees", "Attendees", "participants") or []):
                 if isinstance(a, dict):
-                    name = a.get("displayName") or a.get("name") or a.get("email") or a.get("address") or ''
+                    name = (_ev_get(a, "displayName", "DisplayName") or
+                            _ev_get(a, "name", "Name", "email", "EmailAddress", "address") or '')
                     attendees.append(name)
                 else:
                     attendees.append(str(a))
@@ -602,8 +626,9 @@ def _refresh_calendar():
             )
         db.commit()
 
-        # Compute next meeting
-        row = db.execute("SELECT id,subject,start_time,end_time,location,attendees FROM calendar_events WHERE start_time > ? ORDER BY start_time ASC LIMIT 1", (now.strftime("%Y-%m-%dT%H:%M:%SZ"),)).fetchone()
+        # Compute next meeting (compare in local time since MCP returns local-tz datetimes)
+        now_local = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        row = db.execute("SELECT id,subject,start_time,end_time,location,attendees FROM calendar_events WHERE start_time > ? ORDER BY start_time ASC LIMIT 1", (now_local,)).fetchone()
         if row:
             nm = {"id": row[0], "subject": row[1], "start_time": row[2], "end_time": row[3], "location": row[4], "attendees": json.loads(row[5] or "[]")}
             meta_set("next_meeting", json.dumps(nm))
@@ -619,6 +644,38 @@ def _refresh_calendar():
             return None
 
 
+def _insert_messages(db, emails: list, folder: str) -> int:
+    """INSERT OR IGNORE a list of raw message dicts into the emails table. Returns count added."""
+    now = _utcnow()
+    added = 0
+    for e in emails:
+        if not e.get("id"):
+            continue
+        cur = db.execute(
+            "INSERT OR IGNORE INTO emails "
+            "(id,subject,from_name,from_address,received_date_time,"
+            " is_read,body_preview,conversation_key,raw_json,synced_at,folder) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                e["id"],
+                e.get("subject", ""),
+                e.get("from_name", ""),
+                e.get("from_address", ""),
+                e.get("received_date_time", ""),
+                1 if e.get("is_read") else 0,
+                _clean(e.get("body_preview", ""), 500),
+                _norm_subject(e.get("subject", "")),
+                json.dumps(e),
+                now,
+                folder,
+            ),
+        )
+        if cur.rowcount:
+            added += 1
+    db.commit()
+    return added
+
+
 def _do_sync():
     _sync_status.update({"phase": "fetching", "progress": "Fetching folder list…", "done": 0, "total": 0})
     efforts, other = _refresh_folders()
@@ -630,118 +687,119 @@ def _do_sync():
     except Exception as e:
         print(f"  Calendar refresh failed: {e}")
 
-    _sync_status["progress"] = "Fetching inbox messages…"
-    msgs_result = call_tool("outlook_mail_list_messages", {"folder": "Inbox", "top": INBOX_FETCH})
-    emails = msgs_result.get("messages", []) if isinstance(msgs_result, dict) else []
-    if not emails:
-        return 0, 0
-
-    _sync_status["progress"] = f"Checking {len(emails)} messages for new arrivals…"
     db = get_db()
-    ids = [e["id"] for e in emails if e.get("id")]
-    if not ids:
-        return 0, 0
-    placeholders = ",".join("?" * len(ids))
-    existing_ids = {
-        r[0] for r in db.execute(
-            f"SELECT id FROM emails WHERE id IN ({placeholders})", ids
-        ).fetchall()
-    }
-    new_emails = [e for e in emails if e.get("id") and e["id"] not in existing_ids]
 
-    if not new_emails:
-        _sync_status["progress"] = "No new messages."
-        return 0, 0
+    # ── Phase 1: Inbox — store + AI analyze ────────────────────────────────────
+    _sync_status["progress"] = "Fetching inbox…"
+    msgs_result = call_tool("outlook_mail_list_messages", {"folder": "Inbox", "top": INBOX_FETCH})
+    inbox_emails = msgs_result.get("messages", []) if isinstance(msgs_result, dict) else []
 
-    print(f"Sync: {len(new_emails)} new email(s)")
-    _sync_status["progress"] = f"Inserting {len(new_emails)} new message(s)…"
+    # Determine which inbox messages are new before inserting
+    inbox_ids = [e["id"] for e in inbox_emails if e.get("id")]
+    existing_inbox = set()
+    if inbox_ids:
+        placeholders = ",".join("?" * len(inbox_ids))
+        existing_inbox = {
+            r[0] for r in db.execute(
+                f"SELECT id FROM emails WHERE id IN ({placeholders})", inbox_ids
+            ).fetchall()
+        }
+    new_inbox = [e for e in inbox_emails if e.get("id") and e["id"] not in existing_inbox]
 
-    now = _utcnow()
-    for e in new_emails:
-        ck = _norm_subject(e.get("subject", ""))
-        db.execute(
-            "INSERT OR IGNORE INTO emails "
-            "(id,subject,from_name,from_address,received_date_time,"
-            " is_read,body_preview,conversation_key,raw_json,synced_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (
-                e["id"],
-                e.get("subject", ""),
-                e.get("from_name", ""),
-                e.get("from_address", ""),
-                e.get("received_date_time", ""),
-                1 if e.get("is_read") else 0,
-                _clean(e.get("body_preview", ""), 500),
-                ck,
-                json.dumps(e),
-                now,
-            )
-        )
-    db.commit()
+    if inbox_emails:
+        _insert_messages(db, inbox_emails, "Inbox")
 
-    affected_keys = list({_norm_subject(e.get("subject", "")) for e in new_emails})
+    # AI analyze new inbox threads
     threads_updated = 0
-    total = len(affected_keys)
-    _sync_status.update({"phase": "analyzing", "done": 0, "total": total})
+    if new_inbox:
+        print(f"Sync: {len(new_inbox)} new inbox email(s)")
+        affected_keys = list({_norm_subject(e.get("subject", "")) for e in new_inbox})
+        total = len(affected_keys)
+        _sync_status.update({"phase": "analyzing", "done": 0, "total": total})
 
-    for idx, ck in enumerate(affected_keys):
-        rows = db.execute(
-            "SELECT * FROM emails WHERE conversation_key=? ORDER BY received_date_time ASC",
-            (ck,)
-        ).fetchall()
-        if not rows:
-            continue
-        thread_emails = [dict(r) for r in rows]
-        display_subj = _clean(thread_emails[-1].get("subject", ck), 55)
-        _sync_status["progress"] = f"Analyzing {idx+1}/{total}: \"{display_subj}\""
+        for idx, ck in enumerate(affected_keys):
+            # Only consider inbox emails for thread analysis
+            rows = db.execute(
+                "SELECT * FROM emails WHERE conversation_key=? AND folder='Inbox' "
+                "ORDER BY received_date_time ASC",
+                (ck,)
+            ).fetchall()
+            if not rows:
+                continue
+            thread_emails = [dict(r) for r in rows]
+            display_subj = _clean(thread_emails[-1].get("subject", ck), 55)
+            _sync_status["progress"] = f"Analyzing {idx+1}/{total}: \"{display_subj}\""
 
-        try:
-            result = analyze_thread(thread_emails, efforts, other)
-        except Exception as ex:
-            print(f"  Failed to analyze {ck!r}: {ex}")
-            _sync_status["done"] = idx + 1
-            continue
+            try:
+                result = analyze_thread(thread_emails, efforts, other)
+            except Exception as ex:
+                print(f"  Failed to analyze {ck!r}: {ex}")
+                _sync_status["done"] = idx + 1
+                continue
 
-        latest = thread_emails[-1]
-        participants = list(dict.fromkeys(
-            (_clean(e.get("from_name") or e.get("from_address", ""), 50)).strip()
-            for e in thread_emails
-            if (e.get("from_name") or e.get("from_address"))
-        ))[:8]
-        email_ids = [e["id"] for e in thread_emails]
-        has_unread = any(not e.get("is_read") for e in thread_emails)
+            latest = thread_emails[-1]
+            participants = list(dict.fromkeys(
+                (_clean(e.get("from_name") or e.get("from_address", ""), 50)).strip()
+                for e in thread_emails
+                if (e.get("from_name") or e.get("from_address"))
+            ))[:8]
+            has_unread = any(not e.get("is_read") for e in thread_emails)
 
-        db.execute(
-            "INSERT OR REPLACE INTO threads "
-            "(conversation_key,subject,topic,action,urgency,summary,"
-            " suggested_reply,suggested_folder,participants,email_ids,"
-            " latest_id,message_count,has_unread,latest_received,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                ck,
-                latest["subject"],
-                result.get("topic", "General"),
-                result.get("action", "read"),
-                result.get("urgency", "low"),
-                result.get("summary", ""),
-                result.get("suggestedReply", ""),
-                result.get("suggestedFolder", ""),
-                json.dumps(participants),
-                json.dumps(email_ids),
-                latest["id"],
-                len(thread_emails),
-                1 if has_unread else 0,
-                latest["received_date_time"],
-                _utcnow(),
+            db.execute(
+                "INSERT OR REPLACE INTO threads "
+                "(conversation_key,subject,topic,action,urgency,summary,"
+                " suggested_reply,suggested_folder,participants,email_ids,"
+                " latest_id,message_count,has_unread,latest_received,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    ck,
+                    latest["subject"],
+                    result.get("topic", "General"),
+                    result.get("action", "read"),
+                    result.get("urgency", "low"),
+                    result.get("summary", ""),
+                    result.get("suggestedReply", ""),
+                    result.get("suggestedFolder", ""),
+                    json.dumps(participants),
+                    json.dumps([e["id"] for e in thread_emails]),
+                    latest["id"],
+                    len(thread_emails),
+                    1 if has_unread else 0,
+                    latest["received_date_time"],
+                    _utcnow(),
+                ),
             )
-        )
-        db.commit()
-        threads_updated += 1
-        _sync_status["done"] = idx + 1
-        print(f"  ✓ {display_subj!r} → {result.get('action')} [{result.get('urgency')}]")
+            db.commit()
+            threads_updated += 1
+            _sync_status["done"] = idx + 1
+            print(f"  ✓ {display_subj!r} → {result.get('action')} [{result.get('urgency')}]")
+
+    # ── Phase 2: All other folders — store only, no AI ─────────────────────────
+    top_level = json.loads(meta_get("folders_raw", "[]"))
+    sync_folders = []
+    for f in top_level:
+        name = f.get("display_name") or f.get("displayName", "")
+        if name not in SKIP_SYNC_FOLDERS:
+            sync_folders.append(name)
+    for sub in efforts:
+        sync_folders.append(f"Efforts/{sub}")
+
+    total_folders = len(sync_folders)
+    _sync_status.update({"phase": "fetching", "done": 0, "total": total_folders})
+    for fi, folder_name in enumerate(sync_folders):
+        _sync_status["progress"] = f"Syncing {fi+1}/{total_folders}: {folder_name}…"
+        try:
+            result = call_tool("outlook_mail_list_messages", {"folder": folder_name, "top": FOLDER_FETCH})
+            folder_emails = result.get("messages", []) if isinstance(result, dict) else []
+            added = _insert_messages(db, folder_emails, folder_name)
+            if added:
+                print(f"  {folder_name}: {added} new message(s)")
+        except Exception as ex:
+            print(f"  Warning: could not sync folder '{folder_name}': {ex}")
+        _sync_status["done"] = fi + 1
 
     _sync_status.update({"phase": "done", "progress": f"Done — {threads_updated} thread(s) updated."})
-    return len(new_emails), threads_updated
+    return len(new_inbox), threads_updated
 
 
 def run_sync():
@@ -839,6 +897,114 @@ def api_updates():
         "syncStatus": {**_sync_status},
         "nextMeeting": nm,
     })
+
+
+@app.route("/api/calendar")
+def api_calendar():
+    db = get_db()
+    start_str = request.args.get("start")
+    end_str = request.args.get("end")
+    if not start_str:
+        start_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    if not end_str:
+        end_str = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S")
+    rows = db.execute(
+        "SELECT id,subject,start_time,end_time,location,attendees FROM calendar_events "
+        "WHERE start_time >= ? AND start_time <= ? ORDER BY start_time ASC",
+        (start_str, end_str)
+    ).fetchall()
+    events = [{"id": r[0], "subject": r[1], "start_time": r[2], "end_time": r[3],
+               "location": r[4], "attendees": json.loads(r[5] or "[]")} for r in rows]
+    return jsonify({"events": events})
+
+
+_FOLDER_ICONS = {
+    "Inbox": "📥", "Sent Items": "📤", "Archive": "🗄️",
+    "Drafts": "📝", "Deleted Items": "🗑️", "Junk Email": "🚫",
+}
+_FOLDERS_SKIP_DISPLAY = {
+    "Drafts", "Outbox", "Junk Email",
+    "Conversation History", "RSS Feeds", "Sync Issues", "Scheduled",
+}
+
+
+@app.route("/api/mailbox/folders")
+def api_mailbox_folders():
+    top_level = json.loads(meta_get("folders_raw", "[]"))
+    efforts_subs = json.loads(meta_get("efforts_subfolders", "[]"))
+    folders = []
+    for f in top_level:
+        name = f.get("display_name") or f.get("displayName", "")
+        if not name or name in _FOLDERS_SKIP_DISPLAY:
+            continue
+        if name.lower() == "efforts":
+            folders.append({
+                "name": "Efforts", "icon": "📁",
+                "children": [{"name": s, "path": f"Efforts/{s}", "icon": "📂"}
+                             for s in sorted(efforts_subs)],
+            })
+        else:
+            folders.append({"name": name, "icon": _FOLDER_ICONS.get(name, "📁")})
+    return jsonify({"folders": folders})
+
+
+@app.route("/api/mailbox/folder")
+def api_mailbox_folder():
+    folder = request.args.get("folder", "").strip()
+    if not folder:
+        return jsonify({"threads": [], "total": 0, "folder": ""})
+    offset = int(request.args.get("offset", 0))
+    limit = 100
+    db = get_db()
+    # Latest email per conversation_key in this folder
+    rows = db.execute("""
+        SELECT e.id, e.subject, e.from_name, e.from_address,
+               e.received_date_time, e.body_preview, e.is_read, e.conversation_key,
+               g.cnt, g.unread
+        FROM emails e
+        JOIN (
+            SELECT conversation_key,
+                   MAX(received_date_time) AS latest,
+                   COUNT(*) AS cnt,
+                   SUM(CASE WHEN is_read=0 THEN 1 ELSE 0 END) AS unread
+            FROM emails WHERE folder=?
+            GROUP BY conversation_key
+        ) g ON e.conversation_key = g.conversation_key
+              AND e.received_date_time = g.latest
+              AND e.folder = ?
+        GROUP BY e.conversation_key
+        ORDER BY e.received_date_time DESC
+        LIMIT ? OFFSET ?
+    """, (folder, folder, limit, offset)).fetchall()
+    total = db.execute(
+        "SELECT COUNT(DISTINCT conversation_key) FROM emails WHERE folder=?", (folder,)
+    ).fetchone()[0]
+    threads = [{
+        "id": r["id"], "subject": r["subject"] or "(No subject)",
+        "fromName": r["from_name"] or "", "fromAddress": r["from_address"] or "",
+        "date": r["received_date_time"] or "", "preview": r["body_preview"] or "",
+        "isRead": bool(r["is_read"]), "conversationKey": r["conversation_key"],
+        "messageCount": r["cnt"], "unreadCount": r["unread"],
+    } for r in rows]
+    return jsonify({"threads": threads, "total": total, "folder": folder})
+
+
+@app.route("/api/search")
+def api_search():
+    q = request.args.get("q", "").strip()
+    if len(q) < 2:
+        return jsonify({"results": [], "query": q, "count": 0})
+    like = f"%{q}%"
+    db = get_db()
+    rows = db.execute("""
+        SELECT id, subject, from_name, from_address, received_date_time,
+               body_preview, folder, is_read, conversation_key
+        FROM emails
+        WHERE subject LIKE ? OR from_name LIKE ? OR from_address LIKE ? OR body_preview LIKE ?
+        ORDER BY received_date_time DESC
+        LIMIT 100
+    """, (like, like, like, like)).fetchall()
+    return jsonify({"results": [dict(r) for r in rows], "query": q, "count": len(rows)})
 
 
 @app.route("/api/sync_now", methods=["POST"])
@@ -1527,7 +1693,8 @@ html,body{height:100%;background:#0a1628;color:#c9d1d9;overflow:hidden;}
 .body{display:flex;flex:1;overflow:hidden;}
 
 /* Sidebar */
-.sidebar{width:260px;flex-shrink:0;background:#0a1628;border-right:none;overflow-y:auto;display:flex;flex-direction:column;}
+.sidebar{width:260px;flex-shrink:0;background:#0a1628;border-right:none;display:flex;flex-direction:column;overflow:hidden;}
+.sidebar-scroll{flex:1;overflow-y:auto;display:flex;flex-direction:column;}
 .resize-handle{width:5px;cursor:ew-resize;background:transparent;flex-shrink:0;transition:background .15s;}
 .resize-handle:hover,.resize-handle.dragging{background:#58a6ff;}
 .sidebar-hdr{padding:12px 14px 6px;font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.14em;color:#484f58;}
@@ -1648,16 +1815,11 @@ html,body{height:100%;background:#0a1628;color:#c9d1d9;overflow:hidden;}
 @keyframes sFadeIn{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:translateY(0)}}
 @keyframes sBlink{50%{opacity:0}}
 
-/* Sync */
-.sync-status{display:flex;flex-direction:column;align-items:center;gap:3px;}
-.sync-row{display:flex;align-items:center;gap:7px;font-size:11px;color:#8b949e;}
+/* Sync dot (used in sidebar footer) */
 .sync-dot{width:7px;height:7px;border-radius:50%;background:#3fb950;flex-shrink:0;}
 .sync-dot.syncing{background:#58a6ff;animation:pdot 1s infinite;}
 .sync-dot.error{background:#f85149;}
 @keyframes pdot{0%,100%{opacity:1;transform:scale(1);}50%{opacity:.5;transform:scale(.8);}}
-.sync-txt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:280px;}
-.sync-bar-wrap{width:190px;height:3px;background:#1a3252;border-radius:2px;overflow:hidden;display:none;}
-.sync-bar{height:100%;background:linear-gradient(90deg,#58a6ff,#bc8cff);border-radius:2px;transition:width .4s ease;}
 .new-badge{display:inline-flex;align-items:center;background:#1f6feb;color:#fff;border-radius:9px;font-size:10px;font-weight:600;padding:1px 7px;animation:bpop .3s cubic-bezier(.34,1.56,.64,1);}
 @keyframes bpop{from{transform:scale(0);opacity:0;}to{transform:scale(1);opacity:1;}}
 .badge-sm{display:inline-flex;align-items:center;padding:2px 8px;border-radius:8px;font-size:10.5px;background:#1a3252;color:#8b949e;}
@@ -1733,39 +1895,160 @@ select:focus{border-color:#58a6ff;}
 .triage-sidebar-btn{display:block;width:calc(100% - 16px);margin:0 8px 8px;padding:7px 10px;background:#0d2040;border:1px solid #1a3252;border-radius:7px;color:#8b949e;font-size:12px;cursor:pointer;text-align:left;transition:all .15s;}
 .triage-sidebar-btn:hover{background:#1a3252;color:#c9d1d9;}
 .triage-sidebar-btn.active{background:#1a3252;color:#06b6d4;border-color:#06b6d4;}
+/* Nav buttons */
+.nav-btns{display:flex;gap:3px;}
+.nav-btn{padding:5px 11px;border-radius:6px;font-size:11.5px;font-weight:600;border:1px solid transparent;background:none;color:#8b949e;cursor:pointer;transition:all .15s;white-space:nowrap;}
+.nav-btn:hover{color:#c9d1d9;background:#1a3252;}
+.nav-btn.active{background:#1a3252;color:#58a6ff;border-color:#58a6ff55;}
+/* Search */
+.search-wrap{flex:1;max-width:380px;position:relative;margin:0 12px;}
+.search-input{width:100%;box-sizing:border-box;background:#0d2040;border:1px solid #1a3252;color:#e6edf3;border-radius:7px;padding:6px 12px 6px 30px;font-size:12px;outline:none;font-family:inherit;transition:border-color .15s;}
+.search-input:focus{border-color:#58a6ff66;background:#111d33;}
+.search-input::placeholder{color:#484f58;}
+.search-icon{position:absolute;left:9px;top:50%;transform:translateY(-50%);color:#484f58;font-size:13px;pointer-events:none;}
+/* Search pane */
+.search-pane{flex:1;overflow-y:auto;padding:16px 20px;}
+.search-hdr{font-size:11.5px;color:#8b949e;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid #1a3252;}
+.search-row{display:flex;align-items:flex-start;gap:10px;padding:9px 12px;border-radius:8px;border:1px solid #1a3252;background:#0d2040;margin-bottom:5px;cursor:pointer;transition:border-color .15s;}
+.search-row:hover{border-color:#2a4d7a;}
+.search-row-body{flex:1;min-width:0;}
+.search-row-subj{font-size:12.5px;font-weight:600;color:#e6edf3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.search-row-meta{font-size:10.5px;color:#8b949e;margin-top:2px;}
+.search-row-preview{font-size:11px;color:#484f58;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.search-row-folder{font-size:10px;color:#484f58;background:#1a3252;border-radius:4px;padding:1px 6px;flex-shrink:0;margin-top:2px;white-space:nowrap;}
+/* Mailbox folder tree */
+.folder-tree{padding:4px 0;}
+.folder-item{display:flex;align-items:center;gap:7px;padding:5px 10px;border-radius:6px;margin:1px 6px;cursor:pointer;font-size:12px;color:#8b949e;transition:all .15s;}
+.folder-item:hover{background:#0d2040;color:#c9d1d9;}
+.folder-item.active{background:#1a3252;color:#58a6ff;}
+.folder-group-hdr{display:flex;align-items:center;gap:7px;padding:6px 10px;border-radius:6px;margin:1px 6px;cursor:pointer;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:#7d8fa3;transition:all .15s;}
+.folder-group-hdr:hover{background:#0d2040;color:#c9d1d9;}
+.folder-group-chevron{font-size:9px;margin-left:auto;transition:transform .2s;}
+.folder-group-hdr.open .folder-group-chevron{transform:rotate(180deg);}
+.folder-group-children{padding-left:10px;display:none;}
+.folder-group-children.open{display:block;}
+/* Mailbox right pane */
+.mailbox-pane{display:flex;flex-direction:column;flex:1;overflow:hidden;}
+.mailbox-folder-hdr{padding:11px 18px;font-size:13px;font-weight:700;color:#e6edf3;border-bottom:1px solid #1a3252;flex-shrink:0;display:flex;align-items:baseline;gap:8px;}
+.mailbox-folder-count{font-size:11px;color:#484f58;font-weight:400;}
+.mailbox-list{flex:1;overflow-y:auto;}
+.mbox-row{display:flex;align-items:flex-start;gap:9px;padding:9px 16px;border-bottom:1px solid #12253f;cursor:pointer;transition:background .1s;}
+.mbox-row:hover{background:#0d2040;}
+.mbox-row.active{background:#112240;}
+.mbox-dot{width:7px;height:7px;border-radius:50%;background:#58a6ff;flex-shrink:0;margin-top:5px;}
+.mbox-dot-empty{width:7px;height:7px;flex-shrink:0;}
+.mbox-body{flex:1;min-width:0;}
+.mbox-subj{font-size:12.5px;color:#c9d1d9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.mbox-row.unread .mbox-subj{color:#e6edf3;font-weight:600;}
+.mbox-meta{display:flex;justify-content:space-between;margin-top:2px;}
+.mbox-from{font-size:11px;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;}
+.mbox-date{font-size:10.5px;color:#484f58;flex-shrink:0;margin-left:8px;}
+.mbox-preview{font-size:11px;color:#484f58;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:1px;}
+.mbox-cnt{font-size:10px;color:#484f58;background:#1a3252;border-radius:10px;padding:1px 6px;flex-shrink:0;}
+.mailbox-empty{display:flex;align-items:center;justify-content:center;flex:1;color:#484f58;font-size:13px;padding:40px;}
+.mbox-back{font-size:11px;color:#58a6ff;background:none;border:none;cursor:pointer;padding:0;margin-right:4px;}
+.mbox-back:hover{text-decoration:underline;}
+/* Bottom status bar in sidebar */
+.sidebar-footer{flex-shrink:0;border-top:1px solid #1a3252;padding:8px 12px;margin-top:auto;}
+.sidebar-counts{font-size:10.5px;color:#484f58;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.sidebar-sync-row{display:flex;align-items:center;gap:6px;}
+.sidebar-sync-txt{font-size:10.5px;color:#484f58;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.sidebar-sync-bar-wrap{height:2px;background:#1a3252;border-radius:2px;overflow:hidden;display:none;margin-top:4px;}
+.sidebar-sync-bar{height:100%;background:linear-gradient(90deg,#58a6ff,#bc8cff);border-radius:2px;transition:width .4s ease;}
+
+
+/* Calendar pane */
+.cal-pane{display:flex;flex-direction:column;flex:1;overflow:hidden;background:#0a1628;}
+.cal-nav{display:flex;align-items:center;gap:10px;padding:12px 18px;border-bottom:1px solid #1a3252;flex-shrink:0;}
+.cal-nav-title{flex:1;font-size:14px;font-weight:700;color:#e6edf3;}
+.cal-nav-btn{background:#1a3252;border:1px solid #243f65;color:#8b949e;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px;}
+.cal-nav-btn:hover{color:#c9d1d9;background:#243f65;}
+.cal-today-btn{background:#1f6feb22;border-color:#1f6feb55;color:#58a6ff;}
+.cal-today-btn:hover{background:#1f6feb44;}
+.cal-scroll-wrap{flex:1;overflow:auto;}
+.cal-grid{display:grid;grid-template-columns:52px repeat(7,minmax(0,1fr));min-width:560px;background:#0a1628;}
+.cal-hdr-cell{padding:8px 4px;text-align:center;font-size:11px;font-weight:700;color:#8b949e;border-bottom:1px solid #1a3252;border-right:1px solid #1a3252;background:#0a1628;position:sticky;top:0;z-index:2;min-width:0;}
+.cal-hdr-cell.today{color:#58a6ff;}
+.cal-hdr-corner{border-bottom:1px solid #1a3252;background:#0a1628;position:sticky;top:0;z-index:2;}
+.cal-hdr-day{font-size:13px;font-weight:700;}
+.cal-hdr-dow{font-size:10px;text-transform:uppercase;letter-spacing:.08em;opacity:.7;}
+.cal-time-label{font-size:10px;color:#484f58;text-align:right;padding:0 6px 0 0;line-height:1;padding-top:2px;border-right:1px solid #1a3252;flex-shrink:0;}
+.cal-cell{border-right:1px solid #1a3252;border-bottom:1px solid #12253f;position:relative;min-width:0;overflow:visible;}
+.cal-cell.today-col{background:rgba(88,166,255,.03);}
+.cal-cell.hour-start{border-top:1px solid #1a3252;}
+.cal-event{position:absolute;left:2px;right:2px;border-radius:4px;padding:2px 5px;font-size:10.5px;font-weight:600;overflow:hidden;cursor:pointer;z-index:1;line-height:1.35;transition:filter .15s;}
+.cal-event:hover{filter:brightness(1.2);}
+.cal-event-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.cal-event-time{font-size:9.5px;opacity:.8;white-space:nowrap;}
+.cal-all-day-cell{border-bottom:2px solid #1a3252;border-right:1px solid #1a3252;padding:2px 2px;min-height:20px;min-width:0;overflow:hidden;}
+.cal-all-day-event{background:rgba(88,166,255,.18);border:1px solid rgba(88,166,255,.35);color:#8bb8f8;border-radius:3px;padding:1px 5px;font-size:10px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:1px;}
+.cal-loading{display:flex;align-items:center;justify-content:center;flex:1;color:#484f58;font-size:13px;}
+/* Today's schedule in sidebar */
+.today-cal{border-top:1px solid #1a3252;margin-top:8px;padding:8px 0 4px;}
+.today-cal-hdr{padding:4px 14px 6px;font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.14em;color:#484f58;}
+.today-cal-empty{padding:4px 14px;font-size:11px;color:#484f58;font-style:italic;}
+.today-ev{display:flex;align-items:flex-start;gap:7px;padding:4px 10px;border-radius:6px;margin:0 6px 2px;cursor:default;}
+.today-ev:hover{background:#0d2040;}
+.today-ev-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;margin-top:4px;}
+.today-ev-body{min-width:0;}
+.today-ev-time{font-size:9.5px;color:#484f58;}
+.today-ev-title{font-size:11px;color:#c9d1d9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 </style>
 </head>
 <body>
 <div class="app">
   <header class="header">
     <div class="header-brand">
-      <h1>✉ Email Triage</h1>
-      <span id="email-count" class="badge-sm"></span>
-      <span id="next-meeting" class="badge-sm" style="margin-left:10px"></span>
+      <h1>Email</h1>
+      <span id="next-meeting" class="badge-sm" style="margin-left:4px"></span>
     </div>
     <div class="header-center">
-      <div class="sync-status">
-        <div class="sync-row">
-          <div class="sync-dot" id="sync-dot"></div>
-          <span class="sync-txt" id="sync-txt">Connecting...</span>
-          <span id="new-badge-wrap"></span>
-        </div>
-        <div class="sync-bar-wrap" id="sync-bar-wrap">
-          <div class="sync-bar" id="sync-bar" style="width:0%"></div>
-        </div>
+      <div class="search-wrap">
+        <span class="search-icon">⌕</span>
+        <input type="text" id="search-input" class="search-input" placeholder="Search mail…"
+               onkeydown="if(event.key==='Enter')doSearch(this.value);else if(event.key==='Escape')clearSearch()">
       </div>
     </div>
     <div class="header-right">
-      <button class="btn btn-ghost btn-sm" onclick="triggerSync()">⟳ Sync Now</button>
-      <button class="btn btn-ghost btn-sm" id="resync-thread-btn" onclick="resyncThread()" title="Re-fetch &amp; re-analyze the selected thread" disabled>↺ Resync Thread</button>
-      <button class="btn btn-ghost btn-sm" onclick="reanalyzeAll()" id="reanalyze-btn">⚙ Re-analyze</button>
+      <div class="nav-btns">
+        <button class="nav-btn active" id="nav-email" onclick="switchTab('email')">✉ Triage</button>
+        <button class="nav-btn" id="nav-mailbox" onclick="switchTab('mailbox')">📬 Mailbox</button>
+        <button class="nav-btn" id="nav-calendar" onclick="switchTab('calendar')">📅 Calendar</button>
+      </div>
+      <div id="triage-actions" style="display:flex;gap:6px;align-items:center;">
+        <button class="btn btn-ghost btn-sm" onclick="triggerSync()">⟳ Sync Now</button>
+        <button class="btn btn-ghost btn-sm" id="resync-thread-btn" onclick="resyncThread()" title="Re-fetch &amp; re-analyze the selected thread" disabled>↺ Resync Thread</button>
+        <button class="btn btn-ghost btn-sm" onclick="reanalyzeAll()" id="reanalyze-btn">⚙ Re-analyze</button>
+      </div>
     </div>
   </header>
   <div class="body">
     <nav class="sidebar" id="sidebar">
-      <div class="sidebar-hdr">Threads</div>
-      <button class="triage-sidebar-btn" id="triage-sidebar-btn" onclick="openTriageSheet()">📋 Triage Sheet</button>
-      <div id="topic-list"></div>
+      <div class="sidebar-scroll">
+        <div id="email-nav">
+          <button class="triage-sidebar-btn" id="triage-sidebar-btn" onclick="openTriageSheet()">📋 Triage Sheet</button>
+          <div id="topic-list"></div>
+          <div class="today-cal" id="today-cal">
+            <div class="today-cal-hdr">Today</div>
+            <div id="today-cal-list"><div class="today-cal-empty">Loading…</div></div>
+          </div>
+        </div>
+        <div id="mailbox-nav" style="display:none">
+          <div class="sidebar-hdr">Folders</div>
+          <div id="folder-tree"></div>
+        </div>
+      </div>
+      <div class="sidebar-footer">
+        <div class="sidebar-counts" id="sidebar-counts"></div>
+        <div class="sidebar-sync-row">
+          <div class="sync-dot" id="sync-dot"></div>
+          <span class="sidebar-sync-txt" id="sync-txt">Connecting…</span>
+          <span id="new-badge-wrap"></span>
+        </div>
+        <div class="sidebar-sync-bar-wrap" id="sync-bar-wrap">
+          <div class="sidebar-sync-bar" id="sync-bar" style="width:0%"></div>
+        </div>
+      </div>
     </nav>
     <div class="resize-handle" id="resize-handle"></div>
     <div class="right-pane" id="right-pane">
@@ -1782,6 +2065,31 @@ select:focus{border-color:#58a6ff;}
         <div class="msgs-section" id="msgs-section"></div>
       </div>
       <div class="triage-pane" id="triage-pane" style="display:none"></div>
+      <div class="mailbox-pane" id="mailbox-pane" style="display:none">
+        <div class="mailbox-folder-hdr">
+          <span id="mailbox-folder-name">Select a folder</span>
+          <span class="mailbox-folder-count" id="mailbox-folder-count"></span>
+        </div>
+        <div class="mailbox-list" id="mailbox-list">
+          <div class="mailbox-empty">Select a folder</div>
+        </div>
+      </div>
+      <div class="search-pane" id="search-pane" style="display:none">
+        <div class="search-hdr" id="search-hdr"></div>
+        <div id="search-results"></div>
+      </div>
+      <div class="cal-pane" id="calendar-pane" style="display:none">
+        <div class="cal-nav">
+          <button class="cal-nav-btn" onclick="calMove(-1)">&#8249;</button>
+          <div class="cal-nav-title" id="cal-title"></div>
+          <button class="cal-nav-btn cal-today-btn" onclick="calGoToday()">Today</button>
+          <button class="cal-nav-btn" onclick="calMove(1)">&#8250;</button>
+        </div>
+        <div class="cal-loading" id="cal-loading">Loading calendar…</div>
+        <div class="cal-scroll-wrap" id="cal-scroll-wrap" style="display:none">
+          <div class="cal-grid" id="cal-grid"></div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -1905,10 +2213,11 @@ async function init() {
     const nm = d.nextMeeting || {};
     const nmEl = document.getElementById('next-meeting');
     if (nm && nm.subject && nm.start_time) {
-      nmEl.textContent = `Next: ${esc(nm.subject)} · ${fmtDate((nm.start_time||'').slice(0,19))}`;
+      nmEl.textContent = `Next: ${esc(nm.subject)} · ${fmtUntil(nm.start_time)}`;
     } else if (nmEl) { nmEl.textContent = ''; }
   } catch(e) {}
   renderSidebar();
+  renderTodayCal();
   schedulePoll();
 }
 
@@ -1926,7 +2235,7 @@ async function pollUpdates() {
     const nm = d.nextMeeting || {};
     const nmEl = document.getElementById('next-meeting');
     if (nm && nm.subject && nm.start_time) {
-      nmEl.textContent = `Next: ${esc(nm.subject)} · ${fmtDate((nm.start_time||'').slice(0,19))}`;
+      nmEl.textContent = `Next: ${esc(nm.subject)} · ${fmtUntil(nm.start_time)}`;
     } else if (nmEl) { nmEl.textContent = ''; }
   } catch(e) {}
   if (d.threads && d.threads.length>0) {
@@ -2272,7 +2581,7 @@ function updateSyncStatus(ss) {
     if (ss.total>0){const pct=Math.round((ss.done/ss.total)*100);wrap.style.display='block';bar.style.width=Math.max(4,pct)+'%';}
     else wrap.style.display='none';
   } else {
-    wrap.style.display='none';
+    if(wrap) wrap.style.display='none';
     if (ss.lastError){dot.className='sync-dot error';txt.textContent='Sync error: '+ss.lastError;}
     else if (ss.lastSync){
       dot.className='sync-dot';
@@ -2288,7 +2597,8 @@ function _showNewBadge(n) {
   setTimeout(()=>{w.innerHTML='';},5000);
 }
 function updateCounts(emailCount,threadCount) {
-  const el=document.getElementById('email-count');
+  const el=document.getElementById('sidebar-counts');
+  if (!el) return;
   el.textContent=emailCount!==null?`${emailCount} emails · ${threadCount} threads`:`${threadCount} threads`;
 }
 async function triggerSync() {
@@ -2699,12 +3009,406 @@ function fmtDate(s) {
   if (diff<604800000) return d.toLocaleDateString([],{weekday:'short'});
   return d.toLocaleDateString([],{month:'short',day:'numeric'});
 }
+function fmtUntil(s) {
+  if (!s) return '';
+  const d=new Date(s),now=new Date();
+  if (isNaN(d)) return '';
+  const diff=d-now; // ms until event
+  if (diff<=0) return 'now';
+  const mins=Math.round(diff/60000);
+  if (mins<60) return `in ${mins}m`;
+  const hrs=Math.floor(diff/3600000);
+  const rem=Math.round((diff%3600000)/60000);
+  if (hrs<24) return rem>0?`in ${hrs}h ${rem}m`:`in ${hrs}h`;
+  const days=Math.floor(diff/86400000);
+  const time=d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+  if (days===0) return `today ${time}`;
+  if (days===1) return `tomorrow ${time}`;
+  const dow=d.toLocaleDateString([],{weekday:'short'});
+  return `${dow} ${time}`;
+}
 function esc(s) {
   return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 document.querySelectorAll('.modal-overlay').forEach(m=>
   m.addEventListener('click',e=>{if(e.target===m)closeModals();}));
+
+// ── Tab switching ──────────────────────────────────────────────────────────────
+let activeTab = 'email';
+function switchTab(tab) {
+  activeTab = tab;
+  clearSearch();
+  // Nav button active state
+  ['email','mailbox','calendar'].forEach(t =>
+    document.getElementById('nav-'+t).classList.toggle('active', t===tab));
+  // Sidebar: show for email+mailbox, hide for calendar
+  const showSidebar = tab !== 'calendar';
+  document.getElementById('sidebar').style.display       = showSidebar ? '' : 'none';
+  document.getElementById('resize-handle').style.display = showSidebar ? '' : 'none';
+  // Sidebar content
+  document.getElementById('email-nav').style.display   = tab==='email'    ? '' : 'none';
+  document.getElementById('mailbox-nav').style.display = tab==='mailbox'  ? '' : 'none';
+  // Triage action buttons only in email mode
+  document.getElementById('triage-actions').style.display = tab==='email' ? 'flex' : 'none';
+  // Hide all right-pane views
+  ['empty-pane','thread-detail','triage-pane','mailbox-pane','calendar-pane','search-pane']
+    .forEach(id => document.getElementById(id).style.display = 'none');
+  // Show tab-specific view
+  if (tab === 'email') {
+    const hasThread = !!document.getElementById('thread-detail').dataset.loaded;
+    document.getElementById(hasThread ? 'thread-detail' : 'empty-pane').style.display = '';
+  } else if (tab === 'mailbox') {
+    document.getElementById('mailbox-pane').style.display = 'flex';
+    initMailbox();
+  } else if (tab === 'calendar') {
+    document.getElementById('calendar-pane').style.display = 'flex';
+    renderCalendar();
+  }
+}
+
+// ── Mailbox ────────────────────────────────────────────────────────────────────
+let mailboxFolderLoaded = false;
+async function initMailbox() {
+  if (mailboxFolderLoaded) return;
+  mailboxFolderLoaded = true;
+  const r = await fetch('/api/mailbox/folders').then(r=>r.json()).catch(()=>null);
+  if (!r) return;
+  const tree = document.getElementById('folder-tree');
+  tree.innerHTML = r.folders.map(f => {
+    if (f.children && f.children.length) {
+      return `<div>
+        <div class="folder-group-hdr" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')">
+          <span>${f.icon}</span><span class="folder-item-name">${esc(f.name)}</span>
+          <span class="folder-group-chevron">▾</span>
+        </div>
+        <div class="folder-group-children">
+          ${f.children.map(c=>`<div class="folder-item" data-folder="${esc(c.path||c.name)}" onclick="selectMailboxFolder('${esc(c.path||c.name)}',this)"><span>${c.icon}</span><span class="folder-item-name">${esc(c.name)}</span></div>`).join('')}
+        </div>
+      </div>`;
+    }
+    return `<div class="folder-item" data-folder="${esc(f.name)}" onclick="selectMailboxFolder('${esc(f.name)}',this)"><span>${f.icon}</span><span class="folder-item-name">${esc(f.name)}</span></div>`;
+  }).join('');
+}
+
+let mailboxCurrentFolder = null;
+async function selectMailboxFolder(folder, el) {
+  mailboxCurrentFolder = folder;
+  document.querySelectorAll('.folder-item.active').forEach(e=>e.classList.remove('active'));
+  if (el) el.classList.add('active');
+  document.getElementById('mailbox-folder-name').textContent = folder.split('/').pop();
+  document.getElementById('mailbox-folder-count').textContent = '';
+  document.getElementById('mailbox-list').innerHTML = '<div class="mailbox-empty">Loading…</div>';
+  // Ensure mailbox pane is shown (user might have drilled into a thread)
+  document.getElementById('mailbox-pane').style.display = 'flex';
+  document.getElementById('thread-detail').style.display = 'none';
+  const r = await fetch(`/api/mailbox/folder?folder=${encodeURIComponent(folder)}`).then(r=>r.json()).catch(()=>null);
+  if (!r) { document.getElementById('mailbox-list').innerHTML = '<div class="mailbox-empty">Error loading folder</div>'; return; }
+  document.getElementById('mailbox-folder-count').textContent = `${r.total} thread${r.total!==1?'s':''}`;
+  const list = document.getElementById('mailbox-list');
+  if (!r.threads.length) { list.innerHTML = '<div class="mailbox-empty">No messages</div>'; return; }
+  list.innerHTML = r.threads.map(t => `<div class="mbox-row${!t.isRead?' unread':''}" data-key="${esc(t.conversationKey)}"
+      onclick="openMailboxThread('${esc(t.conversationKey)}','${esc(folder)}')">
+    ${!t.isRead ? '<div class="mbox-dot"></div>' : '<div class="mbox-dot-empty"></div>'}
+    <div class="mbox-body">
+      <div class="mbox-subj">${esc(t.subject)}</div>
+      <div class="mbox-meta">
+        <span class="mbox-from">${esc(t.fromName||t.fromAddress)}</span>
+        <span class="mbox-date">${esc(fmtDate(t.date))}</span>
+      </div>
+      <div class="mbox-preview">${esc(t.preview)}</div>
+    </div>
+    ${t.messageCount>1?`<div class="mbox-cnt">${t.messageCount}</div>`:''}
+  </div>`).join('');
+}
+
+async function openMailboxThread(convKey, folder) {
+  document.querySelectorAll('.mbox-row.active').forEach(e=>e.classList.remove('active'));
+  document.querySelector(`.mbox-row[data-key="${CSS.escape(convKey)}"]`)?.classList.add('active');
+  document.getElementById('mailbox-pane').style.display = 'none';
+  state.selectedKey = convKey;
+  state.expandedMsgs = new Set();
+  state.currentMsgs = [];
+  const hdrEl = document.getElementById('thread-hdr');
+  const msgsEl = document.getElementById('msgs-section');
+  document.getElementById('thread-detail').style.display = 'flex';
+  document.getElementById('thread-detail').dataset.loaded = '1';
+  hdrEl.innerHTML = '<div style="padding:20px"><div class="spinner"></div></div>';
+  msgsEl.innerHTML = '';
+  const r = await fetch(`/api/thread_messages?conversationKey=${encodeURIComponent(convKey)}`).then(r=>r.json()).catch(()=>null);
+  if (!r) { hdrEl.innerHTML = '<div style="padding:20px;color:#8b949e">Error loading messages</div>'; return; }
+  state.currentMsgs = r.messages || [];
+  const latest = state.currentMsgs[state.currentMsgs.length-1] || {};
+  // Use existing triage analysis if available, otherwise show simple header
+  const thread = state.threadMap[convKey];
+  if (thread) {
+    _renderThreadHdr(thread);
+  } else {
+    hdrEl.innerHTML = `<div class="thread-hdr-inner" style="padding:14px 22px 10px">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px">
+        <div class="th-subject">${esc(latest.subject||'(No subject)')}</div>
+        <button class="mbox-back" onclick="backToMailboxList()">← Back</button>
+      </div>
+      <div style="margin-top:6px;font-size:11px;color:#484f58">${esc(folder)}</div>
+    </div>`;
+  }
+  const msgs = state.currentMsgs;
+  msgsEl.innerHTML = `<div class="msgs-label"><span>${msgs.length} message${msgs.length!==1?'s':''}</span></div>`
+    + msgs.map((m,i)=>_msgCardHTML(m,i)).join('');
+}
+
+function backToMailboxList() {
+  document.getElementById('thread-detail').style.display = 'none';
+  document.getElementById('thread-detail').dataset.loaded = '';
+  document.getElementById('mailbox-pane').style.display = 'flex';
+}
+
+// ── Search ─────────────────────────────────────────────────────────────────────
+let searchTimeout = null;
+async function doSearch(q) {
+  q = (q||'').trim();
+  if (q.length < 2) return;
+  // Hide all right-pane content, show search pane
+  ['empty-pane','thread-detail','triage-pane','mailbox-pane','calendar-pane']
+    .forEach(id => document.getElementById(id).style.display = 'none');
+  const pane = document.getElementById('search-pane');
+  pane.style.display = 'flex';
+  pane.style.flexDirection = 'column';
+  document.getElementById('search-hdr').textContent = `Searching for "${q}"…`;
+  document.getElementById('search-results').innerHTML = '<div class="mailbox-empty">Searching…</div>';
+  const r = await fetch(`/api/search?q=${encodeURIComponent(q)}`).then(r=>r.json()).catch(()=>null);
+  if (!r) { document.getElementById('search-results').innerHTML = '<div class="mailbox-empty">Error</div>'; return; }
+  document.getElementById('search-hdr').textContent = `${r.count} result${r.count!==1?'s':''} for "${q}"`;
+  if (!r.results.length) { document.getElementById('search-results').innerHTML = '<div class="mailbox-empty">No results</div>'; return; }
+  document.getElementById('search-results').innerHTML = r.results.map(e => `
+    <div class="search-row" onclick="openSearchResult('${esc(e.conversation_key)}','${esc(e.folder||'')}','${esc(e.id)}')">
+      <div class="search-row-body">
+        <div class="search-row-subj">${esc(e.subject||'(No subject)')}</div>
+        <div class="search-row-meta">${esc(e.from_name||e.from_address||'')} · ${esc(fmtDate((e.received_date_time||'').slice(0,19)))}</div>
+        <div class="search-row-preview">${esc(e.body_preview||'')}</div>
+      </div>
+      <div class="search-row-folder">${esc(e.folder||'Unknown')}</div>
+    </div>`).join('');
+}
+
+function clearSearch() {
+  document.getElementById('search-pane').style.display = 'none';
+}
+
+async function openSearchResult(convKey, folder, emailId) {
+  document.getElementById('search-pane').style.display = 'none';
+  const inInbox = (folder||'').toLowerCase() === 'inbox';
+  if (inInbox && state.threadMap[convKey]) {
+    switchTab('email');
+    selectThread(convKey);
+  } else {
+    switchTab('mailbox');
+    // Small delay to let mailbox init
+    await initMailbox();
+    // Pre-highlight the folder and load the thread
+    const folderEl = document.querySelector(`.folder-item[data-folder="${CSS.escape(folder)}"]`);
+    await openMailboxThread(convKey, folder);
+  }
+}
+
+// ── Calendar ───────────────────────────────────────────────────────────────────
+const CAL_COLORS = [
+  ['#1f6feb','#58a6ff'],['#388bfd22','#79c0ff'],['#1a7f37','#3fb950'],
+  ['#6e40c9','#bc8cff'],['#b45309','#d18616'],['#0e7490','#06b6d4'],
+  ['#9a1c1c','#f85149'],
+];
+let calWeekOffset = 0;
+let calEvents = [];
+let calLoaded = false;
+
+function calGetWeekStart(offset) {
+  const d = new Date();
+  const day = d.getDay(); // 0=Sun
+  const mon = new Date(d);
+  mon.setDate(d.getDate() - ((day+6)%7) + offset*7);
+  mon.setHours(0,0,0,0);
+  return mon;
+}
+
+function calMove(dir) { calWeekOffset += dir; renderCalendar(); }
+function calGoToday() { calWeekOffset = 0; renderCalendar(); }
+
+async function renderCalendar() {
+  const weekStart = calGetWeekStart(calWeekOffset);
+  const weekEnd = new Date(weekStart); weekEnd.setDate(weekStart.getDate()+7);
+
+  // Title
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const s = weekStart, e = new Date(weekEnd); e.setDate(e.getDate()-1);
+  const title = s.getMonth()===e.getMonth()
+    ? `${months[s.getMonth()]} ${s.getDate()} – ${e.getDate()}, ${s.getFullYear()}`
+    : `${months[s.getMonth()]} ${s.getDate()} – ${months[e.getMonth()]} ${e.getDate()}, ${s.getFullYear()}`;
+  document.getElementById('cal-title').textContent = title;
+
+  // Fetch if needed
+  const startISO = weekStart.toISOString().slice(0,19);
+  const endISO = weekEnd.toISOString().slice(0,19);
+  document.getElementById('cal-loading').style.display = 'flex';
+  document.getElementById('cal-scroll-wrap').style.display = 'none';
+  try {
+    const r = await fetch(`/api/calendar?start=${encodeURIComponent(startISO)}&end=${encodeURIComponent(endISO)}`);
+    const d = await r.json();
+    calEvents = d.events || [];
+  } catch(e) { calEvents = []; }
+  document.getElementById('cal-loading').style.display = 'none';
+  document.getElementById('cal-scroll-wrap').style.display = '';
+
+  buildCalGrid(weekStart);
+}
+
+function buildCalGrid(weekStart) {
+  const grid = document.getElementById('cal-grid');
+  const today = new Date(); today.setHours(0,0,0,0);
+  const days = Array.from({length:7}, (_,i) => { const d=new Date(weekStart); d.setDate(weekStart.getDate()+i); return d; });
+  const SLOT_H = 24; // px per 30-min slot
+  const HOUR_START = 7, HOUR_END = 21; // visible hours
+  const SLOTS = (HOUR_END - HOUR_START) * 2;
+
+  // Separate all-day events
+  const allDayEvs = calEvents.filter(ev => {
+    const st = ev.start_time || '';
+    return st.length <= 10 || /T00:00:00/.test(st) && /T00:00:00/.test(ev.end_time||'');
+  });
+  const timedEvs = calEvents.filter(ev => !allDayEvs.includes(ev));
+
+  // Assign colors per event title hash
+  function evColor(subj) {
+    let h=0; for(const c of subj) h=(h*31+c.charCodeAt(0))&0xffff;
+    return CAL_COLORS[h % CAL_COLORS.length];
+  }
+
+  let html = '';
+
+  // Corner + day headers
+  html += `<div class="cal-hdr-corner"></div>`;
+  days.forEach((d,i) => {
+    const isToday = d.getTime()===today.getTime();
+    const dow = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][i];
+    html += `<div class="cal-hdr-cell${isToday?' today':''}">
+      <div class="cal-hdr-dow">${dow}</div>
+      <div class="cal-hdr-day">${d.getDate()}</div>
+    </div>`;
+  });
+
+  // All-day row
+  html += `<div style="font-size:9px;color:#484f58;text-align:right;padding:2px 4px 2px 0;border-right:1px solid #1a3252;border-bottom:2px solid #1a3252;">all day</div>`;
+  days.forEach((d,i) => {
+    const isToday = d.getTime()===today.getTime();
+    const dayStr = d.toISOString().slice(0,10);
+    const evs = allDayEvs.filter(ev => (ev.start_time||'').startsWith(dayStr));
+    html += `<div class="cal-all-day-cell${isToday?' today-col':''}">`;
+    evs.forEach(ev => { html += `<div class="cal-all-day-event" title="${esc(ev.subject)}">${esc(ev.subject)}</div>`; });
+    html += `</div>`;
+  });
+
+  // Time slots
+  for (let slot=0; slot<SLOTS; slot++) {
+    const totalMins = (HOUR_START * 60) + slot * 30;
+    const h = Math.floor(totalMins/60), m = totalMins%60;
+    const isHour = m===0;
+    if (isHour) {
+      const label = h===12?'12pm':h>12?`${h-12}pm`:`${h}am`;
+      html += `<div class="cal-time-label" style="height:${SLOT_H}px;${isHour?'':'border-top:none'}">${label}</div>`;
+    } else {
+      html += `<div class="cal-time-label" style="height:${SLOT_H}px;border-top:none"></div>`;
+    }
+    days.forEach((d,di) => {
+      const isToday = d.getTime()===today.getTime();
+      html += `<div class="cal-cell${isToday?' today-col':''}${isHour?' hour-start':''}" style="height:${SLOT_H}px"></div>`;
+    });
+  }
+
+  grid.innerHTML = html;
+
+  // Position timed events as absolute overlays
+  // We need to position them inside the correct cell after render
+  // Use a post-render approach: collect cells by [day][slot]
+  const cells = grid.querySelectorAll('.cal-cell');
+  const cellMap = {}; // "dayIdx-slot" -> cell el
+  let ci = 0;
+  for (let slot=0; slot<SLOTS; slot++) {
+    for (let di=0; di<7; di++) {
+      cellMap[`${di}-${slot}`] = cells[ci++];
+    }
+  }
+
+  // For each timed event, find its day col and slot range
+  timedEvs.forEach((ev, idx) => {
+    const st = new Date(ev.start_time);
+    const et = new Date(ev.end_time || ev.start_time);
+    const evDay = new Date(st); evDay.setHours(0,0,0,0);
+    const di = days.findIndex(d => d.getTime()===evDay.getTime());
+    if (di < 0) return;
+
+    const startMins = st.getHours()*60 + st.getMinutes();
+    const endMins = et.getHours()*60 + et.getMinutes() || startMins + 30;
+    const startSlot = Math.max(0, Math.floor((startMins - HOUR_START*60)/30));
+    const durationSlots = Math.max(1, Math.ceil((endMins - startMins)/30));
+
+    const anchorCell = cellMap[`${di}-${startSlot}`];
+    if (!anchorCell) return;
+
+    const topOffset = ((startMins - HOUR_START*60) % 30) / 30 * SLOT_H;
+    const height = Math.max(SLOT_H-2, durationSlots * SLOT_H - 2);
+    const [bg, fg] = evColor(ev.subject||'');
+    const timeStr = st.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+
+    const el = document.createElement('div');
+    el.className = 'cal-event';
+    el.style.cssText = `top:${topOffset}px;height:${height}px;background:${bg}33;border:1px solid ${bg}88;color:${fg};`;
+    el.title = `${ev.subject}\\n${timeStr}${ev.location?' · '+ev.location:''}`;
+    el.innerHTML = `<div class="cal-event-title">${esc(ev.subject||'(No title)')}</div><div class="cal-event-time">${timeStr}</div>`;
+    anchorCell.style.position = 'relative';
+    anchorCell.appendChild(el);
+  });
+
+  // Scroll to 8am (1hr from HOUR_START=7 = 2 slots)
+  document.getElementById('cal-scroll-wrap').scrollTop = 2 * SLOT_H;
+}
+
+// ── Today sidebar widget ───────────────────────────────────────────────────────
+async function renderTodayCal() {
+  const today = new Date();
+  const start = new Date(today); start.setHours(0,0,0,0);
+  const end   = new Date(today); end.setHours(23,59,59,0);
+  const startISO = start.toISOString().slice(0,19);
+  const endISO   = end.toISOString().slice(0,19);
+  let events = [];
+  try {
+    const r = await fetch(`/api/calendar?start=${encodeURIComponent(startISO)}&end=${encodeURIComponent(endISO)}`);
+    const d = await r.json();
+    events = (d.events||[]).filter(ev => {
+      // exclude all-day (no time component or midnight-to-midnight)
+      const st = ev.start_time||'';
+      return st.length > 10 && !/T00:00:00/.test(st);
+    });
+  } catch(e) {}
+  const list = document.getElementById('today-cal-list');
+  if (!list) return;
+  if (!events.length) { list.innerHTML = '<div class="today-cal-empty">No meetings today</div>'; return; }
+  function evDotColor(subj) {
+    let h=0; for(const c of subj) h=(h*31+c.charCodeAt(0))&0xffff;
+    return CAL_COLORS[h % CAL_COLORS.length][1];
+  }
+  list.innerHTML = events.map(ev => {
+    const st = new Date(ev.start_time);
+    const timeStr = st.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'});
+    const color = evDotColor(ev.subject||'');
+    const past = st < today;
+    return `<div class="today-ev" style="${past?'opacity:.45':''}">
+      <div class="today-ev-dot" style="background:${color}"></div>
+      <div class="today-ev-body">
+        <div class="today-ev-time">${timeStr}</div>
+        <div class="today-ev-title" title="${esc(ev.subject)}">${esc(ev.subject||'(No title)')}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
 
 // ── Resizable sidebar ──────────────────────────────────────────────────────────
 (function(){
