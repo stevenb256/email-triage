@@ -298,7 +298,7 @@ def analyze_thread(emails: list, efforts_folders: list, other_folders: list) -> 
     msgs_text = "\n\n".join(
         f"From: {_clean(e.get('from_name') or e.get('from_address','Unknown'), 50)} "
         f"| {(e.get('received_date_time',''))[:10]}\n"
-        f"{_clean(e.get('body_preview','(no preview)'), 500)}"
+        f"{_clean(e.get('body_preview','(no preview)'), 2000)}"
         for e in context
     )
 
@@ -416,20 +416,12 @@ Return ONLY this JSON (no markdown fences, no explanation):
         }
 
 
-def _format_message_with_ai(msg: dict) -> list:
-    """Format a single message into AI-annotated paragraphs with intent + fact-check."""
-    body = msg.get("body") or msg.get("body_preview") or ""
-    if not body.strip():
-        return [{"text": "(no content)", "intent": "FYI", "emoji": "📭", "fact_concern": None}]
-
-    from_name = msg.get("from_name") or msg.get("from_address") or "Unknown"
-    date = (msg.get("received_date_time") or "")[:10]
-
-    prompt = f"""You are an expert email analyst helping a senior tech leader understand an email.
+def _format_prompt(body: str, from_name: str, date: str) -> str:
+    return f"""You are an expert email analyst helping a senior tech leader understand an email.
 
 FROM: {_clean(from_name, 80)}  |  DATE: {date}
 EMAIL BODY:
-{_clean(body, 4000)}
+{_clean(body, 8000)}
 
 Break this email into its natural paragraphs. For each paragraph:
 1. Provide the exact paragraph text (verbatim)
@@ -440,20 +432,31 @@ Break this email into its natural paragraphs. For each paragraph:
 Return ONLY valid JSON (no markdown fences):
 {{"paragraphs":[{{"text":"...","intent":"...","emoji":"...","fact_concern":null}}]}}"""
 
+
+def _parse_format_response(raw: str, body: str) -> list:
+    raw = re.sub(r'^```[a-z]*\n?', '', raw.strip())
+    raw = re.sub(r'\n?```$', '', raw.strip())
+    m = re.search(r'\{[\s\S]*\}', raw)
+    if not m:
+        raise ValueError(f"No JSON: {raw[:100]}")
+    result = json.loads(m.group())
+    return result.get("paragraphs", [])
+
+
+def _format_message_with_ai(msg: dict) -> list:
+    """Format a single message into AI-annotated paragraphs with intent + fact-check."""
+    body = msg.get("body") or msg.get("body_preview") or ""
+    if not body.strip():
+        return [{"text": "(no content)", "intent": "FYI", "emoji": "📭", "fact_concern": None}]
+    from_name = msg.get("from_name") or msg.get("from_address") or "Unknown"
+    date = (msg.get("received_date_time") or "")[:10]
     try:
         resp = _get_ai().messages.create(
             model=ANALYSIS_MODEL,
             max_tokens=3000,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": _format_prompt(body, from_name, date)}],
         )
-        raw = resp.content[0].text.strip()
-        raw = re.sub(r'^```[a-z]*\n?', '', raw)
-        raw = re.sub(r'\n?```$', '', raw.strip())
-        m = re.search(r'\{[\s\S]*\}', raw)
-        if not m:
-            raise ValueError(f"No JSON: {raw[:100]}")
-        result = json.loads(m.group())
-        return result.get("paragraphs", [])
+        return _parse_format_response(resp.content[0].text, body)
     except Exception as ex:
         print(f"  Format error: {ex}")
         paras = [p.strip() for p in body.split('\n\n') if p.strip()][:20]
@@ -729,6 +732,172 @@ def api_sync_now():
     return jsonify({"ok": True, "syncStatus": {**_sync_status}})
 
 
+@app.route("/api/resync_thread", methods=["POST"])
+def api_resync_thread():
+    conv_key = (request.json or {}).get("conversationKey", "")
+    if not conv_key:
+        return jsonify({"ok": False, "error": "conversationKey required"}), 400
+    if _sync_status["running"]:
+        return jsonify({"ok": False, "error": "Sync already running"}), 409
+
+    def _do_resync():
+        db = get_db()
+        try:
+            # ── Step 1: Collect known IDs from the thread record (authoritative source)
+            thread_row = db.execute(
+                "SELECT * FROM threads WHERE conversation_key=?", (conv_key,)
+            ).fetchone()
+            stored_ids = []
+            if thread_row:
+                try:
+                    stored_ids = json.loads(dict(thread_row).get("email_ids") or "[]")
+                except Exception:
+                    pass
+            # Also grab any IDs already in the emails table (may differ if data drifted)
+            db_ids = [r[0] for r in db.execute(
+                "SELECT id FROM emails WHERE conversation_key=?", (conv_key,)
+            ).fetchall()]
+            all_ids = list(dict.fromkeys(stored_ids + db_ids))  # deduplicated, stored_ids first
+
+            if not all_ids:
+                _sync_status.update({"running": False, "lastError": "No messages found for thread."})
+                return
+
+            total_steps = len(all_ids) * 2 + 1  # fetch + format + analyze
+            _sync_status.update({"phase": "fetching", "done": 0, "total": total_steps,
+                                  "progress": f"Blowing away cached data for {len(all_ids)} message(s)…"})
+
+            # ── Step 2: Nuke all existing data for this thread
+            db.execute("DELETE FROM emails WHERE conversation_key=?", (conv_key,))
+            db.execute("DELETE FROM threads WHERE conversation_key=?", (conv_key,))
+            db.commit()
+
+            # ── Step 3: Re-fetch every message fresh from Outlook
+            _sync_status["progress"] = f"Re-fetching {len(all_ids)} messages from Outlook…"
+            fresh_msgs = []   # list of normalized msg dicts with full body
+            now = _utcnow()
+            for i, msg_id in enumerate(all_ids):
+                _sync_status["done"] = i
+                _sync_status["progress"] = f"Fetching message {i+1}/{len(all_ids)}…"
+                try:
+                    resp = call_tool("outlook_mail_get_message", {"message_id": msg_id})
+                    if isinstance(resp, dict) and resp:
+                        raw = resp["messages"][0] if isinstance(resp.get("messages"), list) and resp["messages"] else resp
+                    else:
+                        print(f"  Resync: empty response for {msg_id}, skipping")
+                        continue
+                    nm = _normalize_msg(raw)
+                    fresh_msgs.append((msg_id, raw, nm))
+
+                    # Re-insert with FULL quote-stripped body stored (no truncation limit)
+                    ck = _norm_subject(raw.get("subject", "") or nm.get("subject", ""))
+                    full_body = nm.get("body", "")
+                    db.execute(
+                        "INSERT OR REPLACE INTO emails "
+                        "(id,subject,from_name,from_address,received_date_time,"
+                        " is_read,body_preview,conversation_key,raw_json,synced_at,formatted_body) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,NULL)",
+                        (
+                            msg_id,
+                            raw.get("subject", nm.get("subject", "")),
+                            nm.get("from_name", ""),
+                            nm.get("from_address", ""),
+                            nm.get("received_date_time", ""),
+                            1 if raw.get("is_read") else 0,
+                            full_body,   # store full quote-stripped body, no char limit
+                            conv_key,    # keep original conv_key so thread stays together
+                            json.dumps(raw),
+                            now,
+                        )
+                    )
+                    db.commit()
+                except Exception as ex:
+                    print(f"  Resync: failed to re-fetch {msg_id}: {ex}")
+
+            if not fresh_msgs:
+                _sync_status.update({"running": False, "lastError": "Could not re-fetch any messages."})
+                return
+
+            # ── Step 4: Re-analyze the thread (now with full bodies in body_preview)
+            thread_emails = [dict(r) for r in db.execute(
+                "SELECT * FROM emails WHERE conversation_key=? ORDER BY received_date_time ASC", (conv_key,)
+            ).fetchall()]
+            display_subj = _clean(thread_emails[-1].get("subject", conv_key), 55)
+            _sync_status.update({"done": len(all_ids), "progress": f"Re-analyzing \"{display_subj}\"…"})
+
+            efforts = json.loads(meta_get("efforts_subfolders", "[]"))
+            other   = json.loads(meta_get("other_folders", "[]"))
+            result  = analyze_thread(thread_emails, efforts, other)
+
+            latest       = thread_emails[-1]
+            participants = list(dict.fromkeys(
+                (_clean(e.get("from_name") or e.get("from_address", ""), 50)).strip()
+                for e in thread_emails if (e.get("from_name") or e.get("from_address"))
+            ))[:8]
+            fetched_ids  = [e["id"] for e in thread_emails]
+            has_unread   = any(not e.get("is_read") for e in thread_emails)
+
+            db.execute(
+                "INSERT OR REPLACE INTO threads "
+                "(conversation_key,subject,topic,action,urgency,summary,"
+                " suggested_reply,suggested_folder,participants,email_ids,"
+                " latest_id,message_count,has_unread,latest_received,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    conv_key,
+                    latest["subject"],
+                    result.get("topic", "General"),
+                    result.get("action", "read"),
+                    result.get("urgency", "low"),
+                    result.get("summary", ""),
+                    result.get("suggestedReply", ""),
+                    result.get("suggestedFolder", ""),
+                    json.dumps(participants),
+                    json.dumps(fetched_ids),
+                    latest["id"],
+                    len(thread_emails),
+                    1 if has_unread else 0,
+                    latest["received_date_time"],
+                    _utcnow(),
+                )
+            )
+            db.commit()
+
+            # ── Step 5: Re-run AI formatting on every message (warm cache with clean content)
+            _sync_status["progress"] = f"Re-formatting {len(fresh_msgs)} messages with AI…"
+            for i, (msg_id, _raw, nm) in enumerate(fresh_msgs):
+                _sync_status["done"] = len(all_ids) + 1 + i
+                try:
+                    paras = _format_message_with_ai(nm)
+                    db.execute("UPDATE emails SET formatted_body=? WHERE id=?",
+                               (json.dumps(paras), msg_id))
+                    db.commit()
+                except Exception as ex:
+                    print(f"  Resync format error for {msg_id}: {ex}")
+
+            _sync_status.update({
+                "running": False, "threadsUpdated": 1, "lastSync": _utcnow(),
+                "phase": "done",
+                "progress": f"Thread fully resynced — {len(thread_emails)} message(s) rebuilt.",
+            })
+        except Exception as ex:
+            _sync_status.update({"running": False, "lastError": str(ex)})
+            print(f"Resync thread error: {ex}")
+
+    def _run_resync():
+        if not _sync_lock.acquire(blocking=False):
+            return
+        _sync_status.update({"running": True, "lastError": None})
+        try:
+            _do_resync()
+        finally:
+            _sync_lock.release()
+
+    if not _sync_status["running"]:
+        threading.Thread(target=_run_resync, daemon=True).start()
+    return jsonify({"ok": True, "syncStatus": {**_sync_status}})
+
+
 @app.route("/api/reanalyze_all", methods=["POST"])
 def api_reanalyze_all():
     if _sync_status["running"]:
@@ -797,6 +966,29 @@ def _parse_recipients(raw) -> list:
     return result
 
 
+def _strip_quoted_html(html: str) -> str:
+    """Remove quoted/forwarded message blocks from HTML before text extraction."""
+    # Each of these markers signals the start of quoted/forwarded content in Outlook/Gmail.
+    # Content above the marker is always the new text; everything at or after is history.
+    markers = [
+        'id="mail-editor-reference-message-container"',  # Outlook mobile
+        'id="divRplyFwdMsg"',                            # Outlook desktop reply/forward
+        'id="appendonsend"',                             # Outlook append-on-send
+        'class="gmail_quote"',                           # Gmail
+        'id="divTaggedContent"',                         # Another Outlook variant
+    ]
+    lower = html.lower()
+    cut = len(html)
+    for marker in markers:
+        idx = lower.find(marker.lower())
+        if 0 < idx < cut:
+            # Walk back to the opening < of the tag containing this attribute
+            tag_start = html.rfind('<', 0, idx)
+            if tag_start != -1:
+                cut = tag_start
+    return html[:cut]
+
+
 def _normalize_msg(m: dict) -> dict:
     from_name    = m.get("from_name") or ""
     from_address = m.get("from_address") or ""
@@ -804,11 +996,25 @@ def _normalize_msg(m: dict) -> dict:
 
     raw_html = m.get("body_content") or ""
     if raw_html:
-        body_text = re.sub(r'<[^>]+>', ' ', raw_html)
+        # Strip quoted/forwarded history before any other processing
+        raw_html = _strip_quoted_html(raw_html)
+        # Replace block-level elements with newlines to preserve paragraph structure
+        raw_html = re.sub(r'<br\s*/?>', '\n', raw_html, flags=re.IGNORECASE)
+        raw_html = re.sub(r'</?(?:div|p|tr|li|blockquote|hr)[^>]*>', '\n', raw_html, flags=re.IGNORECASE)
+        # Strip all remaining tags
+        body_text = re.sub(r'<[^>]+>', '', raw_html)
         body_text = re.sub(r'&nbsp;', ' ', body_text)
         body_text = re.sub(r'&#\d+;|&[a-z]+;', ' ', body_text)
         body_text = re.sub(r'[ \t]{2,}', ' ', body_text)
         body_text = re.sub(r'\n{3,}', '\n\n', body_text).strip()
+        # Fallback text-level stripping for non-HTML quote patterns
+        # (handles "From: name <email>\nDate: ..." style inline quoting)
+        text_cut = re.search(
+            r'\n[Ff]rom:\s.{3,120}\n\s*(?:[Ss]ent|[Dd]ate|[Tt]o|[Cc]c)\s*:',
+            body_text
+        )
+        if text_cut:
+            body_text = body_text[:text_cut.start()].strip()
     else:
         body_text = m.get("body_preview") or ""
 
@@ -895,6 +1101,91 @@ def api_format_message():
             pass
 
     return jsonify({"paragraphs": paragraphs})
+
+
+@app.route("/api/format_message_stream")
+def api_format_message_stream():
+    from flask import Response, stream_with_context
+    msg_id = request.args.get("id", "")
+    db = get_db()
+    row = db.execute("SELECT * FROM emails WHERE id=?", (msg_id,)).fetchone()
+
+    # Serve from cache immediately as a single done event
+    if row and row["formatted_body"]:
+        try:
+            paras = json.loads(row["formatted_body"])
+            def _cached():
+                yield f"data: {json.dumps({'type':'done','paragraphs':paras})}\n\n"
+            return Response(stream_with_context(_cached()), mimetype="text/event-stream",
+                            headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+        except Exception:
+            pass
+
+    # Fetch full message body
+    fallback = dict(row) if row else {"id": msg_id}
+    try:
+        resp = call_tool("outlook_mail_get_message", {"message_id": msg_id})
+        if isinstance(resp, dict) and "messages" in resp:
+            raw = resp["messages"][0] if resp["messages"] else fallback
+        elif isinstance(resp, dict) and resp:
+            raw = resp
+        else:
+            raw = fallback
+        msg = _normalize_msg(raw)
+    except Exception:
+        msg = _normalize_msg(fallback)
+
+    body = (msg.get("body") or msg.get("body_preview") or "").strip()
+    from_name = msg.get("from_name") or msg.get("from_address") or "Unknown"
+    date = (msg.get("received_date_time") or "")[:10]
+
+    if not body:
+        def _empty():
+            paras = [{"text": "(no content)", "intent": "FYI", "emoji": "📭", "fact_concern": None}]
+            yield f"data: {json.dumps({'type':'done','paragraphs':paras})}\n\n"
+        return Response(stream_with_context(_empty()), mimetype="text/event-stream",
+                        headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+    prompt = _format_prompt(body, from_name, date)
+
+    @stream_with_context
+    def _stream():
+        full_text = ""
+        try:
+            with _get_ai().messages.stream(
+                model=ANALYSIS_MODEL,
+                max_tokens=3000,
+                messages=[{"role": "user", "content": prompt}],
+            ) as stream:
+                for chunk in stream.text_stream:
+                    full_text += chunk
+                    yield f"data: {json.dumps({'type':'token','text':chunk})}\n\n"
+        except Exception as ex:
+            print(f"  Stream format error: {ex}")
+            paras = [{"text": p.strip(), "intent": "FYI", "emoji": "📄", "fact_concern": None}
+                     for p in body.split('\n\n') if p.strip()][:20]
+            yield f"data: {json.dumps({'type':'done','paragraphs':paras})}\n\n"
+            return
+
+        try:
+            paras = _parse_format_response(full_text, body)
+        except Exception:
+            paras = [{"text": p.strip(), "intent": "FYI", "emoji": "📄", "fact_concern": None}
+                     for p in body.split('\n\n') if p.strip()][:20]
+
+        if row:
+            try:
+                db2 = get_db()
+                db2.execute("UPDATE emails SET formatted_body=? WHERE id=?",
+                            (json.dumps(paras), msg_id))
+                db2.commit()
+            except Exception:
+                pass
+
+        yield f"data: {json.dumps({'type':'done','paragraphs':paras})}\n\n"
+
+    return Response(_stream(), mimetype="text/event-stream",
+                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 
 @app.route("/api/generate_reply", methods=["POST"])
@@ -1156,8 +1447,10 @@ html,body{height:100%;background:#0a1628;color:#c9d1d9;overflow:hidden;}
 .msg-hdr{display:flex;align-items:center;gap:9px;padding:9px 13px;cursor:pointer;user-select:none;}
 .msg-hdr:hover{background:rgba(255,255,255,.03);}
 .msg-from{font-size:12px;font-weight:600;color:#c9d1d9;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.msg-preview{font-size:11px;color:#484f58;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:2;max-width:260px;}
+.msg-preview{font-size:11px;color:#06b6d4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:2;max-width:260px;}
 .msg-date{font-size:10.5px;color:#484f58;flex-shrink:0;}
+.msg-recips{padding:1px 13px 5px 46px;font-size:10px;color:#8b949e;display:flex;gap:10px;flex-wrap:wrap;line-height:1.6;}
+.msg-recip-lbl{color:#556070;margin-right:2px;}
 .msg-chevron{color:#484f58;font-size:9px;flex-shrink:0;transition:transform .2s;}
 .msg-card.open .msg-chevron{transform:rotate(180deg);}
 .msg-body{display:none;border-top:1px solid #1a3252;padding:15px;}
@@ -1182,6 +1475,11 @@ html,body{height:100%;background:#0a1628;color:#c9d1d9;overflow:hidden;}
 .para-txt a.link:hover{color:#a5d0ff;}
 .fact-warn{display:flex;align-items:flex-start;gap:6px;background:rgba(240,136,62,.07);border:1px solid rgba(240,136,62,.18);border-radius:6px;padding:6px 10px;margin-top:5px;font-size:11px;color:#f0883e;line-height:1.5;}
 .msg-ai-loading{display:flex;align-items:center;gap:8px;color:#484f58;font-size:11.5px;padding:6px 0;}
+.stream-wrap{padding:10px 16px;}
+.stream-para{font-size:12px;color:#c9d1d9;line-height:1.8;margin-bottom:10px;white-space:pre-wrap;animation:sFadeIn .25s ease;}
+.stream-cursor{display:inline-block;width:2px;height:13px;background:#06b6d4;vertical-align:middle;margin-left:1px;animation:sBlink .7s step-end infinite;}
+@keyframes sFadeIn{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:translateY(0)}}
+@keyframes sBlink{50%{opacity:0}}
 
 /* Sync */
 .sync-status{display:flex;flex-direction:column;align-items:center;gap:3px;}
@@ -1230,6 +1528,44 @@ select:focus{border-color:#58a6ff;}
 .recip-empty{font-size:11px;color:#484f58;font-style:italic;padding:4px 2px;}
 .reply-intent-hint{font-size:11px;color:#5a7a9e;margin-bottom:6px;}
 .generating-overlay{display:flex;align-items:center;gap:8px;color:#58a6ff;font-size:12px;padding:8px 0;}
+
+/* Inline reply */
+.th-inline-reply{margin-top:12px;background:#080f1e;border:1px solid #1a3252;border-radius:8px;padding:11px 13px;}
+.th-ir-lbl{font-size:10px;font-weight:600;color:#484f58;text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px;}
+.th-ir-ta{width:100%;background:#0d2040;border:1px solid #1a3252;border-radius:6px;color:#c9d1d9;font-size:12px;line-height:1.6;padding:8px 10px;resize:vertical;min-height:72px;box-sizing:border-box;font-family:inherit;}
+.th-ir-ta:focus{outline:none;border-color:#2a4d7a;}
+.th-ir-actions{display:flex;gap:7px;margin-top:7px;}
+
+/* Triage sheet */
+.triage-pane{padding:20px 24px;overflow-y:auto;display:flex;flex-direction:column;height:100%;box-sizing:border-box;}
+.triage-hdr{display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-shrink:0;}
+.triage-title{font-size:16px;font-weight:700;color:#e6edf3;flex:1;}
+.triage-queue-count{font-size:11.5px;color:#8b949e;}
+.triage-rows{flex:1;overflow-y:auto;}
+.triage-row{background:#0d2040;border:1px solid #1a3252;border-radius:10px;margin-bottom:9px;padding:13px 15px;transition:border-color .15s;}
+.triage-row.ts-send{border-color:#1a7f37;background:#0d2040;}
+.triage-row.ts-delete{border-color:#9a1c1c;background:#0d2040;}
+.triage-row.ts-file{border-color:#b45309;background:#0d2040;}
+.triage-row.ts-done{border-color:#1a7f37;opacity:.5;}
+.triage-row-top{display:flex;align-items:center;gap:8px;margin-bottom:5px;}
+.triage-subj{font-size:12.5px;font-weight:600;color:#e6edf3;flex:1;}
+.triage-sum{font-size:11.5px;color:#8b949e;line-height:1.55;margin-bottom:8px;}
+.triage-ta{width:100%;background:#080f1e;border:1px solid #1a3252;border-radius:6px;color:#c9d1d9;font-size:11.5px;line-height:1.6;padding:7px 9px;resize:vertical;min-height:56px;box-sizing:border-box;font-family:inherit;}
+.triage-ta:focus{outline:none;border-color:#2a4d7a;}
+.triage-btns{display:flex;gap:5px;margin-top:7px;align-items:center;flex-wrap:wrap;}
+.triage-qlbl{margin-left:auto;font-size:10.5px;font-weight:600;}
+.ts-send .triage-qlbl{color:#1a7f37;}
+.ts-delete .triage-qlbl{color:#f85149;}
+.ts-file .triage-qlbl{color:#b45309;}
+.btn-ts-send{color:#1a7f37;border-color:#1a7f3766;}
+.btn-ts-send:hover,.btn-ts-send.active{background:#1a7f37;color:#fff;border-color:#1a7f37;}
+.btn-ts-del{color:#f85149;border-color:#f8514966;}
+.btn-ts-del:hover,.btn-ts-del.active{background:#9a1c1c;color:#fff;border-color:#9a1c1c;}
+.btn-ts-file{color:#b45309;border-color:#b4530966;}
+.btn-ts-file:hover,.btn-ts-file.active{background:#b45309;color:#fff;border-color:#b45309;}
+.triage-sidebar-btn{display:block;width:calc(100% - 16px);margin:0 8px 8px;padding:7px 10px;background:#0d2040;border:1px solid #1a3252;border-radius:7px;color:#8b949e;font-size:12px;cursor:pointer;text-align:left;transition:all .15s;}
+.triage-sidebar-btn:hover{background:#1a3252;color:#c9d1d9;}
+.triage-sidebar-btn.active{background:#1a3252;color:#06b6d4;border-color:#06b6d4;}
 </style>
 </head>
 <body>
@@ -1253,12 +1589,14 @@ select:focus{border-color:#58a6ff;}
     </div>
     <div class="header-right">
       <button class="btn btn-ghost btn-sm" onclick="triggerSync()">⟳ Sync Now</button>
+      <button class="btn btn-ghost btn-sm" id="resync-thread-btn" onclick="resyncThread()" title="Re-fetch &amp; re-analyze the selected thread" disabled>↺ Resync Thread</button>
       <button class="btn btn-ghost btn-sm" onclick="reanalyzeAll()" id="reanalyze-btn">⚙ Re-analyze</button>
     </div>
   </header>
   <div class="body">
     <nav class="sidebar" id="sidebar">
       <div class="sidebar-hdr">Threads</div>
+      <button class="triage-sidebar-btn" id="triage-sidebar-btn" onclick="openTriageSheet()">📋 Triage Sheet</button>
       <div id="topic-list"></div>
     </nav>
     <div class="resize-handle" id="resize-handle"></div>
@@ -1275,6 +1613,7 @@ select:focus{border-color:#58a6ff;}
         <div class="thread-hdr" id="thread-hdr"></div>
         <div class="msgs-section" id="msgs-section"></div>
       </div>
+      <div class="triage-pane" id="triage-pane" style="display:none"></div>
     </div>
   </div>
 </div>
@@ -1358,6 +1697,9 @@ let state = {
   folders: [],
   effortsFolders: [],
   pollTimer: null,
+  triageActions: {},      // map of conversationKey → {type: 'send'|'delete'|'file', reply: string}
+  triageView: false,
+  showOriginal: {},       // msgId -> true to show original text instead of AI-formatted
 };
 let _activeThread = null;
 
@@ -1472,10 +1814,15 @@ async function selectThread(convKey) {
   state.selectedKey = convKey;
   state.expandedMsgs = new Set();
   state.currentMsgs = [];
+  state.triageView = false;
+  const rb=document.getElementById('resync-thread-btn');
+  if(rb){rb.disabled=false;rb.textContent='↺ Resync Thread';}
   renderSidebar();
   const t = state.threadMap[convKey];
   if (!t) return;
   document.getElementById('empty-pane').style.display='none';
+  document.getElementById('triage-pane').style.display='none';
+  document.getElementById('triage-sidebar-btn').classList.remove('active');
   document.getElementById('thread-detail').style.display='flex';
   _renderThreadHdr(t);
   const sec = document.getElementById('msgs-section');
@@ -1505,9 +1852,8 @@ function _renderThreadHdr(t) {
   const parts=t.participants||[];
   const avHTML=parts.slice(0,5).map(p=>`<span class="avatar" title="${esc(p)}" style="background:${avColor(p)}">${initials(p)}</span>`).join('');
   const dateStr=fmtDate(t.latestReceived||'');
-  let fileBtnHtml=t.suggestedFolder
-    ?`<button class="btn btn-file btn-sm" onclick="quickFile('${enc}','${esc(t.suggestedFolder)}')">📁 ${esc(t.suggestedFolder)}</button>`
-    :`<button class="btn btn-file btn-sm" onclick="openFile('${enc}')">📁 File</button>`;
+  const fileLabel=t.suggestedFolder?`📁 ${esc(t.suggestedFolder)}`:'📁 File';
+  let fileBtnHtml=`<button class="btn btn-file btn-sm" onclick="openFile('${enc}')">${fileLabel}</button>`;
   document.getElementById('thread-hdr').innerHTML=`
     <div class="th-top">
       <div style="flex:1">
@@ -1526,6 +1872,20 @@ function _renderThreadHdr(t) {
       <span class="th-msgcount">${t.messageCount||0} msg${(t.messageCount||0)!==1?'s':''}</span>
     </div>
     ${t.summary?`<div class="th-summary"><div class="th-summary-lbl">🤖 AI Summary</div>${esc(t.summary)}</div>`:''}
+    ${t.suggestedReply
+      ? `<div class="th-inline-reply">
+          <div class="th-ir-lbl">✏️ Suggested Reply</div>
+          <textarea class="th-ir-ta" id="inline-reply-${enc}">${esc(t.suggestedReply)}</textarea>
+          <div class="th-ir-actions">
+            <button class="btn btn-ghost btn-sm" onclick="regenerateInlineReply('${enc}')">↺ Regenerate</button>
+            <button class="btn btn-reply btn-sm" onclick="sendInlineReply('${enc}')">✉ Send</button>
+          </div>
+        </div>`
+      : `<div class="th-inline-reply">
+          <div class="th-ir-lbl">✏️ Suggested Reply</div>
+          <button class="btn btn-ghost btn-sm" onclick="regenerateInlineReply('${enc}')">Generate reply...</button>
+        </div>`
+    }
     <div class="th-actions">
       <button class="btn btn-reply btn-sm" onclick="openReply('${enc}')">↩ Reply</button>
       ${fileBtnHtml}
@@ -1548,14 +1908,24 @@ function _msgCardHTML(m, idx) {
   const bodyText=String(m.body||m.body_preview||'').trim();
   const preview=bodyText.slice(0,100).replace(/\n+/g,' ');
   const isOpen=state.expandedMsgs.has(idx);
+  const toList=(m.to_recipients||[]).map(r=>esc(r.name||r.address)).join(', ');
+  const ccList=(m.cc_recipients||[]).map(r=>esc(r.name||r.address)).join(', ');
+  const recipRow=(toList||ccList)?`<div class="msg-recips">`
+    +(toList?`<span><span class="msg-recip-lbl">To:</span>${toList}</span>`:'')
+    +(ccList?`<span><span class="msg-recip-lbl">CC:</span>${ccList}</span>`:'')
+    +`</div>`:'';
+  const fmtOriginal = !!state.showOriginal[m.id];
+  const fmtBtnLabel = fmtOriginal ? 'AI view' : 'Original';
   return `<div class="msg-card${isOpen?' open':''}" id="mc-${idx}">
     <div class="msg-hdr" onclick="toggleMsg(${idx})">
       <span class="avatar" style="background:${avColor(from)};width:24px;height:24px;font-size:8.5px;border:2px solid #0a1628;flex-shrink:0">${initials(from)}</span>
       <span class="msg-from">${esc(from)}</span>
       <span class="msg-preview">${esc(preview)}</span>
       <span class="msg-date">${esc(date)}</span>
+      <button class="btn btn-ghost btn-sm" id="fmt-btn-${idx}" onclick="(event||window.event).stopPropagation(); toggleFormatView(${idx})">${fmtBtnLabel}</button>
       <span class="msg-chevron">▾</span>
     </div>
+    ${recipRow}
     <div class="msg-body" id="mb-${idx}">${isOpen?_bodyContent(idx):''}
     </div>
   </div>`;
@@ -1564,9 +1934,14 @@ function _msgCardHTML(m, idx) {
 function _bodyContent(idx) {
   const m=state.currentMsgs[idx];
   if (!m) return '';
+  const showOriginal = !!state.showOriginal[m.id];
+  const originalText = String(m.body||m.body_preview||'').trim();
+  if (showOriginal) {
+    return `<div style="font-size:12px;color:#c9d1d9;line-height:1.8;white-space:pre-wrap">${esc(originalText)}</div>`;
+  }
   if (state.formatCache[m.id]) return _renderParas(state.formatCache[m.id]);
   setTimeout(()=>loadFormatted(idx),0);
-  return `<div class="msg-ai-loading"><div class="spinner spinner-sm"></div> Formatting with AI…</div>`;
+  return `<div class="stream-wrap" id="sw-${idx}"><span class="stream-cursor"></span></div>`;
 }
 
 function toggleMsg(idx) {
@@ -1584,17 +1959,73 @@ function toggleMsg(idx) {
   }
 }
 
-async function loadFormatted(idx) {
+function loadFormatted(idx) {
   const m=state.currentMsgs[idx];
   if (!m||!state.expandedMsgs.has(idx)) return;
-  const body=document.getElementById('mb-'+idx);
-  try {
-    const d=await fetch(`/api/format_message?id=${encodeURIComponent(m.id)}`).then(r=>r.json());
-    state.formatCache[m.id]=d.paragraphs||[];
-    if (body&&state.expandedMsgs.has(idx)) body.innerHTML=_renderParas(state.formatCache[m.id]);
-  } catch(e) {
-    const fallback=String(m.body||m.body_preview||'').trim();
-    if (body&&state.expandedMsgs.has(idx)) body.innerHTML=`<div style="font-size:12px;color:#c9d1d9;line-height:1.8;white-space:pre-wrap">${esc(fallback)}</div>`;
+  const bodyEl=document.getElementById('mb-'+idx);
+  if (!bodyEl) return;
+
+  // Cached — render immediately, no stream needed
+  if (state.formatCache[m.id]) {
+    bodyEl.innerHTML=_renderParas(state.formatCache[m.id]);
+    return;
+  }
+
+  // Set up streaming container
+  bodyEl.innerHTML='<div class="stream-wrap" id="sw-'+idx+'"></div>';
+  const wrap=document.getElementById('sw-'+idx);
+  let shownCount=0;
+  let accumulated='';
+
+  const es=new EventSource(`/api/format_message_stream?id=${encodeURIComponent(m.id)}`);
+
+  es.onmessage=(evt)=>{
+    const data=JSON.parse(evt.data);
+    if (data.type==='token') {
+      accumulated+=data.text;
+      if (!wrap||!state.expandedMsgs.has(idx)) {es.close();return;}
+      // Extract completed "text":"..." values as paragraphs become available
+      const matches=[...accumulated.matchAll(/"text":\s*"((?:[^"\\]|\\.)*)"/g)];
+      for (let i=shownCount;i<matches.length;i++) {
+        const txt=matches[i][1].replace(/\\n/g,'\n').replace(/\\"/g,'"').replace(/\\\\/g,'\\');
+        const div=document.createElement('div');
+        div.className='stream-para';
+        div.textContent=txt;
+        wrap.appendChild(div);
+      }
+      shownCount=matches.length;
+      // Keep cursor at end
+      let cur=wrap.querySelector('.stream-cursor');
+      if (!cur){cur=document.createElement('span');cur.className='stream-cursor';wrap.appendChild(cur);}
+      else wrap.appendChild(cur); // move to end
+    } else if (data.type==='done') {
+      es.close();
+      state.formatCache[m.id]=data.paragraphs||[];
+      // Only overwrite the body with AI view if the user hasn't switched to Original
+      if (bodyEl&&state.expandedMsgs.has(idx) && !state.showOriginal[m.id]) bodyEl.innerHTML=_renderParas(state.formatCache[m.id]);
+    }
+  };
+
+  es.onerror=()=>{
+    es.close();
+    if (bodyEl&&state.expandedMsgs.has(idx)) {
+      const fallback=String(m.body||m.body_preview||'').trim();
+      bodyEl.innerHTML=`<div style="font-size:12px;color:#c9d1d9;line-height:1.8;white-space:pre-wrap">${esc(fallback)}</div>`;
+    }
+  };
+}
+
+function toggleFormatView(idx) {
+  const m = state.currentMsgs[idx];
+  if (!m) return;
+  state.showOriginal[m.id] = !state.showOriginal[m.id];
+  const bodyEl = document.getElementById('mb-'+idx);
+  const btn = document.getElementById('fmt-btn-'+idx);
+  if (btn) btn.textContent = state.showOriginal[m.id] ? 'AI view' : 'Original';
+  if (state.expandedMsgs.has(idx) && bodyEl) {
+    bodyEl.innerHTML = _bodyContent(idx);
+    // If switching to AI view and content isn't cached yet, trigger load
+    if (!state.showOriginal[m.id] && !state.formatCache[m.id]) loadFormatted(idx);
   }
 }
 
@@ -1679,6 +2110,20 @@ function updateCounts(emailCount,threadCount) {
 async function triggerSync() {
   const d=await fetch('/api/sync_now',{method:'POST'}).then(r=>r.json()).catch(()=>null);
   if (d) updateSyncStatus(d.syncStatus);
+}
+async function resyncThread() {
+  const convKey=state.selectedKey;
+  if (!convKey) return;
+  const btn=document.getElementById('resync-thread-btn');
+  btn.disabled=true; btn.textContent='↺ Resyncing…';
+  const d=await fetch('/api/resync_thread',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({conversationKey:convKey})}).then(r=>r.json()).catch(()=>null);
+  if (d) updateSyncStatus(d.syncStatus);
+  // Reload the thread view after resync completes
+  setTimeout(async()=>{
+    btn.disabled=false; btn.textContent='↺ Resync Thread';
+    if (state.selectedKey===convKey) await selectThread(convKey);
+  }, 1500);
 }
 async function reanalyzeAll() {
   const btn=document.getElementById('reanalyze-btn');
@@ -1844,9 +2289,220 @@ async function _act(url,body,convKey) {
     state.selectedKey=null;
     document.getElementById('thread-detail').style.display='none';
     document.getElementById('empty-pane').style.display='flex';
+    const rb=document.getElementById('resync-thread-btn');
+    if(rb) rb.disabled=true;
   }
   renderSidebar();
   updateCounts(null,Object.keys(state.threadMap).length);
+}
+
+// ── Inline reply ───────────────────────────────────────────────────────────────
+async function sendInlineReply(enc) {
+  const t = decodeThread(enc);
+  const ta = document.getElementById('inline-reply-'+enc);
+  const body = ta ? ta.value.trim() : '';
+  if (!body) return;
+  const res = await fetch('/api/reply/'+t.latestId, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({body, conversationKey: t.conversationKey, to: [], cc: []})
+  }).then(r=>r.json()).catch(()=>null);
+  if (!res || !res.ok) { alert('Error: '+(res&&res.error||'Unknown error')); return; }
+  delete state.threadMap[t.conversationKey];
+  for (const g of state.groups) g.threads = g.threads.filter(th=>th.conversationKey!==t.conversationKey);
+  state.groups = state.groups.filter(g=>g.threads.length>0);
+  if (state.selectedKey===t.conversationKey) {
+    state.selectedKey = null;
+    document.getElementById('thread-detail').style.display='none';
+    document.getElementById('empty-pane').style.display='flex';
+    const rb=document.getElementById('resync-thread-btn');
+    if(rb) rb.disabled=true;
+  }
+  renderSidebar();
+  updateCounts(null, Object.keys(state.threadMap).length);
+}
+
+async function regenerateInlineReply(enc) {
+  const t = decodeThread(enc);
+  const ta = document.getElementById('inline-reply-'+enc);
+  if (ta) { ta.value = '⏳ Generating...'; ta.disabled = true; }
+  try {
+    const res = await fetch('/api/suggested_reply', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({conversationKey: t.conversationKey})
+    }).then(r=>r.json());
+    if (res.reply) {
+      const thread = state.threadMap[t.conversationKey];
+      if (thread) thread.suggestedReply = res.reply;
+      if (ta) { ta.value = res.reply; ta.disabled = false; }
+      else {
+        // textarea may not exist yet (was "Generate reply..." button) — re-render header
+        const fullThread = state.threadMap[t.conversationKey];
+        if (fullThread) _renderThreadHdr(fullThread);
+      }
+    } else {
+      if (ta) { ta.value = ''; ta.disabled = false; }
+    }
+  } catch(e) {
+    if (ta) { ta.value = ''; ta.disabled = false; }
+    alert('Error regenerating reply: '+e);
+  }
+}
+
+// ── Triage sheet ───────────────────────────────────────────────────────────────
+function openTriageSheet() {
+  state.triageView = true;
+  state.selectedKey = null;
+  document.getElementById('empty-pane').style.display='none';
+  document.getElementById('thread-detail').style.display='none';
+  document.getElementById('triage-pane').style.display='flex';
+  document.getElementById('triage-sidebar-btn').classList.add('active');
+  renderSidebar();
+  renderTriageSheet();
+}
+
+function renderTriageSheet() {
+  const pane = document.getElementById('triage-pane');
+  const queuedCount = Object.keys(state.triageActions).length;
+  const allThreads = [];
+  for (const g of state.groups) for (const t of g.threads) allThreads.push(t);
+
+  let rowsHtml = allThreads.map(t => {
+    const convKey = t.conversationKey;
+    const action = state.triageActions[convKey];
+    const actionCls = action ? 'ts-'+action.type : '';
+    const urgCls = {high:'urg-high',medium:'urg-medium',low:'urg-low'}[t.urgency]||'urg-low';
+    const parts = (t.participants||[]).slice(0,3).join(', ');
+    const replyVal = action ? action.reply : (t.suggestedReply||'');
+    let statusLbl = '';
+    if (action) {
+      if (action.type==='send') statusLbl='↗ Reply queued';
+      else if (action.type==='delete') statusLbl='🗑 Delete queued';
+      else if (action.type==='file') statusLbl='📁 File queued';
+    }
+    return `<div class="triage-row ${actionCls}" id="triage-row-${esc(convKey)}">
+      <div class="triage-row-top">
+        <span class="urg-pill ${urgCls}">${(t.urgency||'low').toUpperCase()}</span>
+        <span class="triage-subj">${esc(t.subject||'(No subject)')}</span>
+        <span style="font-size:10.5px;color:#484f58">${esc(parts)}</span>
+      </div>
+      ${t.summary?`<div class="triage-sum">${esc(t.summary)}</div>`:''}
+      <textarea class="triage-ta" id="tr-reply-${esc(convKey)}">${esc(replyVal)}</textarea>
+      <div class="triage-btns">
+        <button class="btn btn-ghost btn-sm btn-ts-send${action&&action.type==='send'?' active':''}" onclick="triageMark('${esc(convKey)}','send')">✉ Send Reply</button>
+        <button class="btn btn-ghost btn-sm btn-ts-file${action&&action.type==='file'?' active':''}" onclick="triageMark('${esc(convKey)}','file')">📁 File</button>
+        <button class="btn btn-ghost btn-sm btn-ts-del${action&&action.type==='delete'?' active':''}" onclick="triageMark('${esc(convKey)}','delete')">🗑 Delete</button>
+        <button class="btn btn-ghost btn-sm" onclick="triageMark('${esc(convKey)}',null)">✕ Clear</button>
+        <span class="triage-qlbl">${esc(statusLbl)}</span>
+      </div>
+    </div>`;
+  }).join('');
+
+  pane.innerHTML = `<div class="triage-hdr">
+    <button class="btn btn-ghost btn-sm" onclick="closeTriageSheet()">← Back</button>
+    <span class="triage-title">📋 Triage Sheet</span>
+    <span class="triage-queue-count" id="triage-queue-count">${queuedCount} queued</span>
+    <button class="btn btn-reply btn-sm" id="triage-execute-btn" onclick="executeAllActions()"${queuedCount===0?' disabled':''}>⚡ Execute All Actions</button>
+  </div>
+  <div class="triage-rows">${rowsHtml}</div>`;
+}
+
+function closeTriageSheet() {
+  state.triageView = false;
+  document.getElementById('triage-pane').style.display='none';
+  document.getElementById('triage-sidebar-btn').classList.remove('active');
+  document.getElementById('empty-pane').style.display='flex';
+}
+
+function triageMark(convKey, type) {
+  if (type === null) {
+    delete state.triageActions[convKey];
+  } else {
+    const replyEl = document.getElementById('tr-reply-'+convKey);
+    state.triageActions[convKey] = {type, reply: replyEl ? replyEl.value : ''};
+  }
+  // Update row visual state
+  const row = document.getElementById('triage-row-'+convKey);
+  if (row) {
+    row.className = 'triage-row' + (type ? ' ts-'+type : '');
+    const qlbl = row.querySelector('.triage-qlbl');
+    if (qlbl) {
+      if (!type) qlbl.textContent = '';
+      else if (type==='send') qlbl.textContent = '↗ Reply queued';
+      else if (type==='delete') qlbl.textContent = '🗑 Delete queued';
+      else if (type==='file') qlbl.textContent = '📁 File queued';
+    }
+    // Update active class on buttons
+    row.querySelectorAll('.btn-ts-send,.btn-ts-del,.btn-ts-file').forEach(btn=>{
+      btn.classList.remove('active');
+    });
+    if (type==='send') { const b=row.querySelector('.btn-ts-send'); if(b) b.classList.add('active'); }
+    else if (type==='delete') { const b=row.querySelector('.btn-ts-del'); if(b) b.classList.add('active'); }
+    else if (type==='file') { const b=row.querySelector('.btn-ts-file'); if(b) b.classList.add('active'); }
+  }
+  // Update execute button + count
+  const queuedCount = Object.keys(state.triageActions).length;
+  const countEl = document.getElementById('triage-queue-count');
+  if (countEl) countEl.textContent = queuedCount+' queued';
+  const execBtn = document.getElementById('triage-execute-btn');
+  if (execBtn) execBtn.disabled = queuedCount === 0;
+}
+
+async function executeAllActions() {
+  const entries = Object.entries(state.triageActions);
+  if (!entries.length) return;
+  const execBtn = document.getElementById('triage-execute-btn');
+  let done = 0;
+  const total = entries.length;
+  for (const [convKey, action] of entries) {
+    if (execBtn) execBtn.textContent = `Executing ${done+1}/${total}...`;
+    const thread = state.threadMap[convKey];
+    if (!thread) { done++; continue; }
+    try {
+      if (action.type === 'send') {
+        await fetch('/api/reply/'+thread.latestId, {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({body: action.reply, conversationKey: convKey, to: [], cc: []})
+        });
+      } else if (action.type === 'delete') {
+        await fetch('/api/delete', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ids: thread.emailIds, conversationKey: convKey})
+        });
+      } else if (action.type === 'file') {
+        await fetch('/api/move', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ids: thread.emailIds, folder: thread.suggestedFolder||'', conversationKey: convKey})
+        });
+      }
+    } catch(e) {
+      console.error('Execute action error for '+convKey, e);
+    }
+    // Mark row as done
+    const row = document.getElementById('triage-row-'+convKey);
+    if (row) {
+      row.className = 'triage-row ts-done';
+      const qlbl = row.querySelector('.triage-qlbl');
+      if (qlbl) qlbl.textContent = '✓ Done';
+    }
+    // Remove from state
+    delete state.triageActions[convKey];
+    delete state.threadMap[convKey];
+    for (const g of state.groups) g.threads = g.threads.filter(t=>t.conversationKey!==convKey);
+    state.groups = state.groups.filter(g=>g.threads.length>0);
+    done++;
+  }
+  if (execBtn) execBtn.textContent = `All done! ${done} action${done!==1?'s':''} executed`;
+  if (execBtn) execBtn.disabled = true;
+  renderSidebar();
+  updateCounts(null, Object.keys(state.threadMap).length);
+  // Update queue count
+  const countEl = document.getElementById('triage-queue-count');
+  if (countEl) countEl.textContent = '0 queued';
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
