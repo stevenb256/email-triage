@@ -1242,6 +1242,57 @@ Return ONLY the reply body text. No subject line, no "From:", no markdown fences
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/suggested_reply", methods=["POST"])
+def api_suggested_reply():
+    conv_key = (request.json or {}).get("conversationKey", "")
+    if not conv_key:
+        return jsonify({"error": "conversationKey required"}), 400
+    db = get_db()
+    rows = db.execute("SELECT * FROM emails WHERE conversation_key=? ORDER BY received_date_time ASC", (conv_key,)).fetchall()
+    if not rows:
+        return jsonify({"error": "No messages found for thread."}), 404
+    emails = [dict(r) for r in rows]
+    efforts = json.loads(meta_get("efforts_subfolders", "[]"))
+    other = json.loads(meta_get("other_folders", "[]"))
+    try:
+        result = analyze_thread(emails, efforts, other)
+        latest = emails[-1]
+        participants = list(dict.fromkeys(
+            (_clean(e.get("from_name") or e.get("from_address", ""), 50)).strip()
+            for e in emails if (e.get("from_name") or e.get("from_address"))
+        ))[:8]
+        email_ids = [e["id"] for e in emails]
+        has_unread = any(not e.get("is_read") for e in emails)
+        db.execute(
+            "INSERT OR REPLACE INTO threads "
+            "(conversation_key,subject,topic,action,urgency,summary,"
+            " suggested_reply,suggested_folder,participants,email_ids,"
+            " latest_id,message_count,has_unread,latest_received,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                conv_key,
+                latest.get("subject", ""),
+                result.get("topic", "General"),
+                result.get("action", "read"),
+                result.get("urgency", "low"),
+                result.get("summary", ""),
+                result.get("suggestedReply", ""),
+                result.get("suggestedFolder", ""),
+                json.dumps(participants),
+                json.dumps(email_ids),
+                latest.get("id", ""),
+                len(emails),
+                1 if has_unread else 0,
+                latest.get("received_date_time", ""),
+                _utcnow(),
+            )
+        )
+        db.commit()
+        return jsonify({"reply": result.get("suggestedReply", "")})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/reply/<latest_id>", methods=["POST"])
 def api_reply(latest_id):
     body     = request.json.get("body", "")
