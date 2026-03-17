@@ -8,6 +8,11 @@ import anthropic
 
 from config import ANALYSIS_MODEL, REPLY_MODEL, ANTHROPIC_API_KEY
 
+# Lazy import to avoid circular dependency — only used in analyze_thread
+def _call_tool(name, args):
+    from mcp_client import call_tool
+    return call_tool(name, args)
+
 # ─── Topic normalization ───────────────────────────────────────────────────────
 
 CANONICAL_TOPICS = [
@@ -58,6 +63,64 @@ def _clean(s, n=None) -> str:
     return s[:n] if n else s
 
 
+def _get_full_body(email: dict) -> str:
+    """
+    Return the best available body text for an email, fetching from Outlook if needed.
+    Priority: formatted_body (cached AI parse) > full body from MCP > body_preview fallback.
+    Strips HTML tags for clean plain text.
+    """
+    # 1. formatted_body is a JSON array of {text, intent, ...} — already plain text paragraphs
+    fb = email.get("formatted_body")
+    if fb:
+        try:
+            paras = json.loads(fb) if isinstance(fb, str) else fb
+            if isinstance(paras, list) and paras:
+                text = "\n\n".join(p.get("text", "") for p in paras if p.get("text"))
+                if len(text) > 100:
+                    return _clean(text, 8000)
+        except Exception:
+            pass
+
+    # 2. body_html — strip tags for plain text
+    bh = email.get("body_html", "")
+    if bh and len(bh) > 200:
+        plain = re.sub(r'<[^>]+>', ' ', bh)
+        plain = re.sub(r'[ \t]{2,}', ' ', plain)
+        plain = re.sub(r'\n{3,}', '\n\n', plain).strip()
+        if len(plain) > 100:
+            return _clean(plain, 8000)
+
+    # 3. Fetch full message from Outlook MCP — returns body_content (HTML string) directly
+    msg_id = email.get("id", "")
+    if msg_id:
+        try:
+            resp = _call_tool("outlook_mail_get_message", {"message_id": msg_id})
+            raw = None
+            if isinstance(resp, dict):
+                raw = resp["messages"][0] if resp.get("messages") else resp
+
+            if raw:
+                # MCP returns body_content (HTML) as a top-level field
+                content = raw.get("body_content") or ""
+                if not content:
+                    # also check nested body dict just in case
+                    body = raw.get("body", {})
+                    if isinstance(body, dict):
+                        content = body.get("content", "")
+
+                if content:
+                    plain = re.sub(r'<[^>]+>', ' ', content)
+                    plain = re.sub(r'[ \t]{2,}', ' ', plain)
+                    plain = re.sub(r'\n{3,}', '\n\n', plain).strip()
+                    if len(plain) > 50:
+                        return _clean(plain, 8000)
+        except Exception as ex:
+            print(f"  _get_full_body fetch failed for {msg_id[:20]}: {ex}")
+
+    # 4. body_preview is all we have
+    return _clean(email.get("body_preview", "(no content)"), 2000)
+
+
 # ─── Anthropic client ──────────────────────────────────────────────────────────
 
 _ai = None
@@ -81,12 +144,15 @@ def analyze_thread(emails: list, efforts_folders: list, other_folders: list, rep
     ))[:8]
 
     context = emails[-8:]
-    msgs_text = "\n\n".join(
-        f"From: {_clean(e.get('from_name') or e.get('from_address','Unknown'), 50)} "
-        f"| {(e.get('received_date_time',''))[:10]}\n"
-        f"{_clean(e.get('body_preview','(no preview)'), 2000)}"
-        for e in context
-    )
+    msg_parts = []
+    for e in context:
+        body = _get_full_body(e)
+        msg_parts.append(
+            f"From: {_clean(e.get('from_name') or e.get('from_address','Unknown'), 50)} "
+            f"| {(e.get('received_date_time',''))[:10]}\n"
+            f"{body}"
+        )
+    msgs_text = "\n\n---\n\n".join(msg_parts)
 
     if efforts_folders:
         efforts_list = ", ".join(efforts_folders[:15])
@@ -181,7 +247,7 @@ Return ONLY this JSON (no markdown fences, no explanation):
     try:
         resp = _get_ai().messages.create(
             model=ANALYSIS_MODEL,
-            max_tokens=3000,
+            max_tokens=4000,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = resp.content[0].text.strip()
