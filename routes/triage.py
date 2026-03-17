@@ -295,7 +295,10 @@ def api_reanalyze_all():
             display_subj = _clean(thread_emails[-1].get("subject", ck), 55)
             _sync_status["progress"] = f"Re-analyzing {idx+1}/{total}: \"{display_subj}\""
             try:
-                result = analyze_thread(thread_emails, efforts, other)
+                existing_topics = [r[0] for r in db.execute(
+                    "SELECT DISTINCT topic FROM threads WHERE topic != '' AND conversation_key != ?",(ck,)
+                ).fetchall()]
+                result = analyze_thread(thread_emails, efforts, other, existing_topics=existing_topics)
                 db.execute(
                     "UPDATE threads SET topic=?,action=?,urgency=?,summary=?,"
                     "suggested_reply=?,suggested_folder=?,updated_at=? WHERE conversation_key=?",
@@ -411,7 +414,10 @@ def api_resync_thread():
 
             efforts = json.loads(meta_get("efforts_subfolders", "[]"))
             other   = json.loads(meta_get("other_folders", "[]"))
-            result  = analyze_thread(thread_emails, efforts, other)
+            existing_topics = [r[0] for r in db.execute(
+                "SELECT DISTINCT topic FROM threads WHERE topic != '' AND conversation_key != ?", (conv_key,)
+            ).fetchall()]
+            result  = analyze_thread(thread_emails, efforts, other, existing_topics=existing_topics)
 
             latest       = thread_emails[-1]
             participants = list(dict.fromkeys(

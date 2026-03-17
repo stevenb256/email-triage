@@ -334,9 +334,12 @@ def _do_sync():
             thread_emails = [dict(r) for r in rows]
             display_subj = _clean(thread_emails[-1].get("subject", ck), 55)
             _sync_status["progress"] = f"Analyzing {idx+1}/{total}: \"{display_subj}\""
+            existing_topics = [r[0] for r in db.execute(
+                "SELECT DISTINCT topic FROM threads WHERE topic != ''"
+            ).fetchall()]
 
             try:
-                result = analyze_thread(thread_emails, efforts, other)
+                result = analyze_thread(thread_emails, efforts, other, existing_topics=existing_topics)
             except Exception as ex:
                 print(f"  Failed to analyze {ck!r}: {ex}")
                 _sync_status["done"] = idx + 1

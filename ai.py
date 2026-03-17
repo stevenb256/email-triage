@@ -13,47 +13,12 @@ def _call_tool(name, args):
     from mcp_client import call_tool
     return call_tool(name, args)
 
-# ─── Topic normalization ───────────────────────────────────────────────────────
-
-CANONICAL_TOPICS = [
-    "Engineering", "Incidents & Outages", "Product Planning", "Partnerships",
-    "Finance", "Team & HR", "Customer Issues", "Legal & Compliance",
-    "Events & Travel", "FYI & Updates", "Strategy & Leadership",
-    "Architecture & Design", "External Communications",
-]
-
-# Ordered rules: first match wins (most specific first)
-_TOPIC_RULES = [
-    (["incident", "outage", "sev "],                                     "Incidents & Outages"),
-    (["financ", "budget", "expense", "billing", "payment"],              "Finance"),
-    (["legal", "compliance", "gdpr", "regulation"],                      "Legal & Compliance"),
-    (["travel", "conference", "offsite", "summit"],                      "Events & Travel"),
-    (["partnership", "customer stor", "customer engag"],                 "Partnerships"),
-    (["team", " hr ", "hiring", "recruit", "headcount", "people ops"],   "Team & HR"),
-    (["customer issue", "client issue", "support ticket"],               "Customer Issues"),
-    (["architect", "system design"],                                     "Architecture & Design"),
-    (["strateg", "leadership", "executive", "vision", "okr"],            "Strategy & Leadership"),
-    (["external comm", "press", "announcement"],                         "External Communications"),
-    (["product plan", "product updat", "product launch", "product feat",
-      "product metric", "product rev", "product eval", "product qual",
-      "product dev", "roadmap", "feature", "launch", "sprint"],          "Product Planning"),
-    (["engineer", "infrastructure", "replatform", "deploy", "migration",
-      "latency", "reliab", "scale", "resource alloc", "capacity",
-      "cost", "performance", "metric", "tools", "develop"],              "Engineering"),
-    (["project update", "status", "progress", "fyi", "update"],          "FYI & Updates"),
-]
-
+# ─── Topic sanitization ────────────────────────────────────────────────────────
 
 def _normalize_topic(raw: str) -> str:
-    """Map a free-form LLM topic to a canonical category."""
-    r = raw.lower()
-    for c in CANONICAL_TOPICS:
-        if c.lower() == r:
-            return c                    # exact match
-    for keywords, canonical in _TOPIC_RULES:
-        if any(kw in r for kw in keywords):
-            return canonical
-    return "FYI & Updates"             # fallback
+    """Sanitize a free-form topic label — trim whitespace, cap length, title-case."""
+    t = re.sub(r'\s+', ' ', str(raw or "").strip())
+    return t[:50] if t else "General"
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -135,7 +100,7 @@ def _get_ai():
 
 # ─── AI functions ──────────────────────────────────────────────────────────────
 
-def analyze_thread(emails: list, efforts_folders: list, other_folders: list, reply_context: str = "") -> dict:
+def analyze_thread(emails: list, efforts_folders: list, other_folders: list, reply_context: str = "", existing_topics: list = None) -> dict:
     emails = sorted(emails, key=lambda e: e.get("received_date_time", ""))
     participants = list(dict.fromkeys(
         (_clean(e.get("from_name") or e.get("from_address", ""), 50)).strip()
@@ -166,12 +131,29 @@ def analyze_thread(emails: list, efforts_folders: list, other_folders: list, rep
 
     subject = _clean(emails[-1].get("subject", "(no subject)"), 100)
 
+    # Build topic guidance — existing topics let Claude reuse groups instead of fragmenting
+    if existing_topics:
+        existing_list = ", ".join(f'"{t}"' for t in sorted(set(existing_topics))[:30])
+        topic_guidance = (
+            f"\nEXISTING TOPICS (reuse one if it fits — exact match required): {existing_list}"
+            f"\nIf none fit, create a NEW topic: 2-4 words, project/initiative focused "
+            f"(e.g. 'SharePoint Copilot', 'GPU Migration', 'Search Evaluation', 'Team Hiring'). "
+            f"Not too broad ('Engineering') and not too narrow ('RE: GPU ticket #4821'). "
+            f"Use title case. Do not add qualifiers like 'Thread' or 'Discussion'."
+        )
+    else:
+        topic_guidance = (
+            "\nCreate a topic: 2-4 words, project/initiative focused "
+            "(e.g. 'SharePoint Copilot', 'GPU Migration', 'Search Evaluation', 'Team Hiring'). "
+            "Not too broad ('Engineering') and not too narrow. Use title case."
+        )
+
     prompt = f"""You are a world-class executive communication assistant for a senior engineering/product leader at a large tech company.
 Analyze this email thread and return ONLY valid JSON.
 
 SUBJECT: {subject}
 PARTICIPANTS: {', '.join(participants)}
-TOTAL MESSAGES: {len(emails)}{folder_guidance}
+TOTAL MESSAGES: {len(emails)}{folder_guidance}{topic_guidance}
 
 MESSAGES (chronological, most recent last):
 {msgs_text}
@@ -234,7 +216,7 @@ INSTRUCTIONS:
 Return ONLY this JSON (no markdown fences, no explanation):
 {{
   "summary": "REQUIRED FORMAT — write exactly 3 parts separated by a blank line:\\n\\nPART 1 — FACTS (2-4 sentences): Report only verifiable facts from the thread. Name every person by first and last name and their role. State exact numbers, dates, system names, project names, metrics, decisions, blockers, and deadlines. Quote or closely paraphrase the specific ask or decision verbatim. If a number or date was mentioned, it must appear here. Zero vagueness — 'progress was shared' is wrong; 'latency dropped from 420ms to 180ms' is right.\\n\\nPART 2 — OPEN QUESTIONS / BLOCKERS (1-3 bullets): List every unanswered question, unresolved decision, or blocker explicitly stated or implied in the thread. If none, write 'None'.\\n\\nPART 3 — YOUR NEXT ACTION (1 sentence): Tell the reader exactly what they need to do and by when. Be imperative and specific: 'Reply to Jane by EOD approving the Q3 budget increase to $2.4M' or 'No action needed — file for reference' or 'Read and acknowledge — Liu is waiting on your signal to proceed'.",
-  "topic": "broad category label (e.g. Engineering, Product Planning, Finance, Incidents & Outages, Team & HR, Partnerships, FYI & Updates, Strategy & Leadership)",
+  "topic": "project/initiative label — reuse an existing topic if it fits, otherwise 2-4 words like 'SharePoint Copilot' or 'GPU Migration'",
   "action": "reply OR delete OR file OR read OR done",
   "urgency": "high OR medium OR low",
   "suggestedReply": "complete draft reply or empty string only if deleting",
