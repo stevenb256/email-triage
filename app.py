@@ -664,12 +664,16 @@ def _refresh_calendar():
 
 
 def _insert_messages(db, emails: list, folder: str) -> int:
-    """INSERT OR IGNORE a list of raw message dicts into the emails table. Returns count added."""
+    """Upsert a list of raw message dicts into the emails table.
+    New rows are inserted; existing rows have mutable fields (is_read, folder, raw_json)
+    updated so the DB stays in sync with Outlook.
+    Returns count of newly inserted rows."""
     now = _utcnow()
     added = 0
     for e in emails:
         if not e.get("id"):
             continue
+        is_read = 1 if e.get("is_read") else 0
         cur = db.execute(
             "INSERT OR IGNORE INTO emails "
             "(id,subject,from_name,from_address,received_date_time,"
@@ -681,7 +685,7 @@ def _insert_messages(db, emails: list, folder: str) -> int:
                 e.get("from_name", ""),
                 e.get("from_address", ""),
                 e.get("received_date_time", ""),
-                1 if e.get("is_read") else 0,
+                is_read,
                 _clean(e.get("body_preview", ""), 500),
                 _norm_subject(e.get("subject", "")),
                 json.dumps(e),
@@ -691,6 +695,12 @@ def _insert_messages(db, emails: list, folder: str) -> int:
         )
         if cur.rowcount:
             added += 1
+        else:
+            # Row exists — update mutable fields without touching cached formatted_body
+            db.execute(
+                "UPDATE emails SET is_read=?, folder=?, raw_json=?, synced_at=? WHERE id=?",
+                (is_read, folder, json.dumps(e), now, e["id"]),
+            )
     db.commit()
     return added
 
@@ -743,6 +753,24 @@ def _do_sync():
 
     if inbox_emails:
         _insert_messages(db, inbox_emails, "Inbox")
+
+    # Purge inbox emails that are no longer in Outlook inbox (moved/deleted)
+    # inbox_ids is the complete current inbox from Outlook (fully paginated)
+    if inbox_ids:
+        db_inbox_ids = {r[0] for r in db.execute(
+            "SELECT id FROM emails WHERE folder='Inbox'"
+        ).fetchall()}
+        stale = db_inbox_ids - set(inbox_ids)
+        if stale:
+            ph = ",".join("?" * len(stale))
+            db.execute(f"DELETE FROM emails WHERE id IN ({ph})", list(stale))
+            # Remove thread records that no longer have any inbox emails
+            db.execute(
+                "DELETE FROM threads WHERE conversation_key NOT IN "
+                "(SELECT DISTINCT conversation_key FROM emails WHERE folder='Inbox')"
+            )
+            db.commit()
+            print(f"Sync: purged {len(stale)} stale inbox email(s) no longer in Outlook")
 
     # AI analyze new inbox threads
     threads_updated = 0
@@ -808,6 +836,19 @@ def _do_sync():
             threads_updated += 1
             _sync_status["done"] = idx + 1
             print(f"  ✓ {display_subj!r} → {result.get('action')} [{result.get('urgency')}]")
+
+    # Recompute has_unread for all threads based on current is_read state in emails table.
+    # This keeps threads in sync even when emails are read in native Outlook/mobile.
+    db.executescript("""
+        UPDATE threads SET has_unread = (
+            SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END
+            FROM emails
+            WHERE emails.conversation_key = threads.conversation_key
+              AND emails.folder = 'Inbox'
+              AND emails.is_read = 0
+        );
+    """)
+    db.commit()
 
     # ── Phase 2: All other folders — store only, no AI ─────────────────────────
     top_level = json.loads(meta_get("folders_raw", "[]"))
@@ -1877,7 +1918,7 @@ HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Email Triage</title>
+<title>Clanker</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;font-family:'Monaco','Menlo','Courier New',monospace;}
 html,body{height:100%;background:#0a1628;color:#c9d1d9;overflow:hidden;}
@@ -1929,7 +1970,17 @@ html,body{height:100%;background:#0a1628;color:#c9d1d9;overflow:hidden;}
 
 /* Right pane */
 .right-pane{flex:1;overflow:hidden;display:flex;flex-direction:column;background:#0a1628;border-left:1px solid #1e3d6b;}
-#first-load{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;}
+#first-load{position:fixed;inset:0;background:#060f1e;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0;z-index:99999;transition:opacity .6s ease;}
+#first-load.fade-out{opacity:0;pointer-events:none;}
+.splash-ascii{font-family:'Monaco','Menlo','Courier New',monospace;font-size:clamp(5px,1vw,13px);line-height:1.18;white-space:pre;color:#0d7ec4;text-shadow:0 0 18px #0d7ec4aa,0 0 40px #0d7ec455;letter-spacing:0;animation:splash-glow 2.4s ease-in-out infinite alternate;}
+@keyframes splash-glow{from{text-shadow:0 0 10px #0d7ec488,0 0 30px #0d7ec433;}to{text-shadow:0 0 22px #38bdf8cc,0 0 55px #38bdf877,0 0 90px #0d7ec444;}}
+.splash-sub{font-family:'Monaco','Menlo','Courier New',monospace;font-size:13px;color:#38bdf8;letter-spacing:.35em;text-transform:uppercase;margin-top:22px;opacity:.85;animation:splash-glow 2.4s ease-in-out infinite alternate;}
+.splash-tagline{font-size:11px;color:#3d6a9e;letter-spacing:.2em;margin-top:8px;text-transform:uppercase;}
+.splash-loader{display:flex;align-items:center;gap:10px;margin-top:32px;font-size:11px;color:#2a5a8a;letter-spacing:.1em;}
+.splash-dots span{animation:splash-dot 1.2s infinite;opacity:0;}
+.splash-dots span:nth-child(2){animation-delay:.2s;}
+.splash-dots span:nth-child(3){animation-delay:.4s;}
+@keyframes splash-dot{0%,80%,100%{opacity:0;}40%{opacity:1;}}
 .empty-pane{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:#5ba4cf;}
 .empty-pane .ep-icon{font-size:36px;opacity:.35;}
 .empty-pane .ep-txt{font-size:12px;}
@@ -2081,7 +2132,8 @@ select:focus{border-color:#58a6ff;}
 .triage-hdr{display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-shrink:0;}
 .triage-title{font-size:16px;font-weight:700;color:#e6edf3;flex:1;}
 .triage-queue-count{font-size:11.5px;color:#8b949e;}
-.triage-kb-hint{font-size:10px;color:#5ba4cf;margin-left:auto;}
+.msg-owa-link{font-size:13px;color:#5a7a9e;text-decoration:none;flex-shrink:0;margin-left:2px;opacity:.7;transition:opacity .15s;}
+.msg-owa-link:hover{opacity:1;color:#58a6ff;}
 .triage-rows{flex:1;overflow-y:auto;}
 /* Topic groups */
 .triage-topic-group{margin-bottom:12px;}
@@ -2266,7 +2318,7 @@ select:focus{border-color:#58a6ff;}
 <div class="app">
   <header class="header">
     <div class="header-brand">
-      <h1>Email</h1>
+      <h1>Clanker</h1>
     </div>
     <div class="header-center">
       <div class="search-wrap">
@@ -2314,8 +2366,18 @@ select:focus{border-color:#58a6ff;}
     <div class="resize-handle" id="resize-handle"></div>
     <div class="right-pane" id="right-pane">
       <div id="first-load">
-        <div class="spinner"></div>
-        <div class="load-txt" id="load-msg">Loading inbox...</div>
+        <div class="splash-ascii"> ██████╗██╗      █████╗ ███╗   ██╗██╗  ██╗███████╗██████╗
+██╔════╝██║     ██╔══██╗████╗  ██║██║ ██╔╝██╔════╝██╔══██╗
+██║     ██║     ███████║██╔██╗ ██║█████╔╝ █████╗  ██████╔╝
+██║     ██║     ██╔══██║██║╚██╗██║██╔═██╗ ██╔══╝  ██╔══██╗
+╚██████╗███████╗██║  ██║██║ ╚████║██║  ██╗███████╗██║  ██║
+ ╚═════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝</div>
+        <div class="splash-sub">AI First Collab</div>
+        <div class="splash-tagline">Powered by Claude · Outlook · MCP</div>
+        <div class="splash-loader">
+          <div class="spinner spinner-sm" style="border-top-color:#38bdf8;border-color:#1a3252;border-top-color:#38bdf8"></div>
+          <span id="load-msg">Connecting to inbox</span><span class="splash-dots"><span>.</span><span>.</span><span>.</span></span>
+        </div>
       </div>
       <div class="empty-pane" id="empty-pane" style="display:none">
         <div class="ep-icon">✉</div>
@@ -2502,7 +2564,9 @@ async function init() {
   state.groups.forEach(g=>g.threads.forEach(t=>{state.threadMap[t.conversationKey]=t;}));
   state.collapsedTopics = new Set(state.groups.map(g=>g.topic));
   state.latestTs = d.latestTs;
-  document.getElementById('first-load').style.display='none';
+  const splash = document.getElementById('first-load');
+  splash.classList.add('fade-out');
+  setTimeout(()=>{ splash.style.display='none'; }, 650);
   updateCounts(d.emailCount, Object.keys(state.threadMap).length);
   updateSyncStatus(d.syncStatus);
 
@@ -2675,8 +2739,9 @@ function _msgCardHTML(m, idx) {
     +(toList?`<span><span class="msg-recip-lbl">To:</span>${toList}</span>`:'')
     +(ccList?`<span><span class="msg-recip-lbl">CC:</span>${ccList}</span>`:'')
     +`</div>`:'';
-  const fmtOriginal = !!state.showOriginal[m.id];
   const hasHtml = !!(m.body_html);
+  // Default: HTML view if html available, AI view otherwise. showOriginal[id] overrides.
+  const fmtOriginal = state.showOriginal[m.id] !== undefined ? !!state.showOriginal[m.id] : hasHtml;
   const fmtBtnLabel = fmtOriginal ? 'AI view' : (hasHtml ? 'HTML' : 'Original');
   return `<div class="msg-card${isOpen?' open':''}" id="mc-${idx}">
     <div class="msg-hdr" onclick="toggleMsg(${idx})">
@@ -2684,6 +2749,7 @@ function _msgCardHTML(m, idx) {
       <span class="msg-from-wrap"><span class="msg-from">${esc(from)}</span><span class="msg-preview">${esc(preview)}</span></span>
       <span class="msg-date">${esc(date)}</span>
       <button class="btn btn-ghost btn-sm" id="fmt-btn-${idx}" onclick="(event||window.event).stopPropagation(); toggleFormatView(${idx})">${fmtBtnLabel}</button>
+      <a class="msg-owa-link" href="${'https://outlook.office.com/owa/?ItemID='+encodeURIComponent(m.id)+'&exvsurl=1&viewmodel=ReadMessageItem'}" target="_blank" rel="noopener" title="Open in Outlook Web" onclick="event.stopPropagation()">📎</a>
       <span class="msg-chevron">▾</span>
     </div>
     ${recipRow}
@@ -2695,7 +2761,8 @@ function _msgCardHTML(m, idx) {
 function _bodyContent(idx) {
   const m=state.currentMsgs[idx];
   if (!m) return '';
-  const showOriginal = !!state.showOriginal[m.id];
+  const hasHtml = !!(m.body_html);
+  const showOriginal = state.showOriginal[m.id] !== undefined ? !!state.showOriginal[m.id] : hasHtml;
   const originalText = String(m.body||m.body_preview||'').trim();
   if (showOriginal) {
     if (m.body_html) {
@@ -2785,13 +2852,15 @@ function loadFormatted(idx) {
 function toggleFormatView(idx) {
   const m = state.currentMsgs[idx];
   if (!m) return;
-  state.showOriginal[m.id] = !state.showOriginal[m.id];
+  // Effective current state (mirrors _bodyContent default logic)
+  const hasHtml = !!(m.body_html);
+  const current = state.showOriginal[m.id] !== undefined ? !!state.showOriginal[m.id] : hasHtml;
+  state.showOriginal[m.id] = !current;
   const bodyEl = document.getElementById('mb-'+idx);
   const btn = document.getElementById('fmt-btn-'+idx);
-  if (btn) btn.textContent = state.showOriginal[m.id] ? 'AI view' : (m.body_html ? 'HTML' : 'Original');
+  if (btn) btn.textContent = state.showOriginal[m.id] ? 'AI view' : (hasHtml ? 'HTML' : 'Original');
   if (state.expandedMsgs.has(idx) && bodyEl) {
     bodyEl.innerHTML = _bodyContent(idx);
-    // If switching to AI view and content isn't cached yet, trigger load
     if (!state.showOriginal[m.id] && !state.formatCache[m.id]) loadFormatted(idx);
   }
 }
@@ -3195,9 +3264,28 @@ async function toggleFlag(enc) {
   }
   renderSidebar();
 }
+function _showActSpinner(msg) {
+  let el = document.getElementById('act-spinner');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'act-spinner';
+    el.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#0d2040;border:1px solid #2a5a8a;border-radius:10px;padding:10px 20px;display:flex;align-items:center;gap:10px;font-size:13px;color:#c9d1d9;z-index:99999;box-shadow:0 8px 24px rgba(0,0,0,.5);transition:opacity .2s;';
+    document.body.appendChild(el);
+  }
+  el.innerHTML = `<div class="spinner spinner-sm" style="border-top-color:#58a6ff"></div>${msg}`;
+  el.style.opacity = '1';
+}
+function _hideActSpinner() {
+  const el = document.getElementById('act-spinner');
+  if (el) { el.style.opacity = '0'; setTimeout(()=>el.remove(), 200); }
+}
+
 async function _act(url,body,convKey) {
+  const label = url.includes('delete') ? 'Deleting…' : url.includes('move') ? 'Filing…' : 'Sending…';
+  _showActSpinner(label);
   const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const d=await res.json();
+  const d=await res.json().catch(()=>({}));
+  _hideActSpinner();
   if (!d.ok) return alert('Error: '+(d.error||'Unknown error'));
   // Find next mailbox row before removing from DOM
   const mboxRow = document.querySelector(`.mbox-row[data-key="${CSS.escape(convKey)}"]`);
@@ -3475,9 +3563,17 @@ function renderTriageSheet() {
     <span class="triage-title">📋 Triage Sheet</span>
     <span class="triage-queue-count" id="triage-queue-count">${queuedCount} queued</span>
     <button class="btn btn-reply btn-sm" id="triage-execute-btn" onclick="executeAllActions()"${queuedCount===0?' disabled':''}>⚡ Execute All</button>
-    <span class="triage-kb-hint">↑↓ navigate · Enter expand · R reply · D delete · F file · Esc back</span>
   </div>
-  <div class="triage-rows">${groupsHtml}</div>`;
+  <div class="triage-rows">${groupsHtml}</div>
+  <div class="mbox-kb-hint">
+    <span><kbd>j</kbd><kbd>k</kbd> navigate</span>
+    <span><kbd>Enter</kbd> expand</span>
+    <span><kbd>r</kbd> reply</span>
+    <span><kbd>d</kbd> delete</span>
+    <span><kbd>f</kbd> file</span>
+    <span><kbd>x</kbd> clear</span>
+    <span><kbd>Esc</kbd> back</span>
+  </div>`;
 }
 
 // ── Triage keyboard navigation ──────────────────────────────────────────────
@@ -4033,8 +4129,10 @@ async function mboxQuickDelete(convKey) {
   const nextRow = row?.nextElementSibling;
   // Animate out
   if (row) { row.style.opacity='0'; row.style.transition='opacity .15s'; }
+  _showActSpinner('Deleting…');
   await fetch('/api/delete', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ids: thread.emailIds, conversationKey: convKey})});
+  _hideActSpinner();
   if (row) row.remove();
   delete state.threadMap[convKey];
   for (const g of state.groups) g.threads = g.threads.filter(t=>t.conversationKey!==convKey);
@@ -4443,7 +4541,10 @@ async function updateWeekHours() {
     const r = await fetch(`/api/calendar?start=${encodeURIComponent(mon.toISOString().slice(0,19))}&end=${encodeURIComponent(sat.toISOString().slice(0,19))}`);
     const d = await r.json();
     const evs = (d.events||[]).filter(ev => {
-      const st=ev.start_time||''; return st.length>10 && !/T00:00:00/.test(st);
+      const st=ev.start_time||'';
+      if (st.length<=10 || /T00:00:00/.test(st)) return false;
+      if (/NO\s*MTGS/i.test(ev.subject||'')) return false;
+      return true;
     });
     let mins = 0;
     evs.forEach(ev => {
