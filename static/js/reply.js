@@ -6,9 +6,8 @@ async function openReply(enc) {
   _activeThread = _replyState.thread;
   const t = _replyState.thread;
 
-  // Build reply-all recipients: sender + all To recipients, CC from latest message; filter self
-  // Use newest message (index 0 after newest-first sort)
-  const latest = state.currentMsgs[0];
+  // Build reply-all from ALL messages in thread: collect every sender + To across all msgs into To,
+  // every CC across all msgs into CC; deduplicate; exclude self; anyone in To is removed from CC.
   _replyState.to = [];
   _replyState.cc = [];
   const myAddr = MY_EMAIL.toLowerCase();
@@ -17,14 +16,15 @@ async function openReply(enc) {
     if (r.address.toLowerCase() === myAddr) return; // exclude self
     if (!list.find(x=>x.address.toLowerCase()===r.address.toLowerCase())) list.push(r);
   };
-  if (latest) {
-    // Sender goes to To
-    if (latest.from_address) addUniq(_replyState.to, {name:latest.from_name||latest.from_address, address:latest.from_address});
-    // All To recipients
-    for (const r of (latest.to_recipients||[])) addUniq(_replyState.to, r);
-    // All CC recipients
-    for (const r of (latest.cc_recipients||[])) addUniq(_replyState.cc, r);
+  for (const msg of state.currentMsgs) {
+    if (msg.from_address) addUniq(_replyState.to, {name:msg.from_name||msg.from_address, address:msg.from_address});
+    for (const r of (msg.to_recipients||[])) addUniq(_replyState.to, r);
+    for (const r of (msg.cc_recipients||[])) addUniq(_replyState.cc, r);
   }
+  // Remove anyone already in To from CC
+  _replyState.cc = _replyState.cc.filter(
+    r => !_replyState.to.find(t => t.address.toLowerCase() === r.address.toLowerCase())
+  );
 
   document.getElementById('reply-sub').textContent = `Re: ${t.subject||''}`;
   const bodyEl = document.getElementById('reply-body');
