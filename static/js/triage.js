@@ -61,7 +61,9 @@ function _triageRowHTML(t) {
   const expanded = state.expandedTriageRows.has(convKey);
   const urgCls = {high:'urg-high',medium:'urg-medium',low:'urg-low'}[t.urgency]||'urg-low';
   const rec = ACTION_REC[t.action] || ACTION_REC.read;
-  const statusLbl = action ? (action.type==='delete'?'🗑 Queued':action.type==='file'?'📁 Queued':'') : '';
+  const folder = t.suggestedFolder || '';
+  const fileLbl = folder ? `📁 ${folder}` : '📁 File';
+  const statusLbl = action ? (action.type==='delete'?'🗑 Queued':action.type==='file'?`📁 → ${folder||'?'}`:'') : '';
   const msgsHtml = expanded ? _triageMsgsHTML(convKey) : '';
   return `<div class="triage-row${actionCls}${expanded?' expanded':''}" id="triage-row-${esc(convKey)}" data-convkey="${esc(convKey)}">
     <div class="triage-row-summary" data-triage-expand="1">
@@ -76,7 +78,7 @@ function _triageRowHTML(t) {
     <div class="triage-msgs" id="triage-msgs-${esc(convKey)}" style="${expanded?'':'display:none'}">${msgsHtml}</div>
     <div class="triage-btns">
       <button class="btn btn-reply btn-sm" data-triage-action="reply">↩ Reply</button>
-      <button class="btn btn-ghost btn-sm btn-ts-file${action&&action.type==='file'?' active':''}" data-triage-action="file">📁 File</button>
+      <button class="btn btn-ghost btn-sm btn-ts-file${action&&action.type==='file'?' active':''}" data-triage-action="file">${esc(fileLbl)}</button>
       <button class="btn btn-ghost btn-sm btn-ts-del${action&&action.type==='delete'?' active':''}" data-triage-action="delete">🗑 Delete</button>
       ${action?`<button class="btn btn-ghost btn-sm" data-triage-action="clear">✕</button>`:''}
       <span class="triage-qlbl">${esc(statusLbl)}</span>
