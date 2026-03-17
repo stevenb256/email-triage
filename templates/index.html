@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Clanker</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/base.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/layout.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/triage.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/thread.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/modals.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/folder.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/calendar.css') }}">
+</head>
+<body>
+<div class="app">
+  <header class="header">
+    <div class="header-brand">
+      <h1>Clanker</h1>
+    </div>
+    <div class="header-center">
+      <div class="search-wrap">
+        <span class="search-icon">⌕</span>
+        <input type="text" id="search-input" class="search-input" placeholder="Search mail…"
+               onkeydown="if(event.key==='Enter')doSearch(this.value);else if(event.key==='Escape')clearSearch()">
+      </div>
+    </div>
+    <div class="header-right">
+      <div id="triage-actions" style="display:flex;gap:6px;align-items:center;">
+        <button class="btn btn-reply btn-sm" onclick="openCompose()" style="font-weight:700">✉ New Message</button>
+        <button class="btn btn-ghost btn-sm" onclick="triggerSync()">⟳ Sync Now</button>
+        <button class="btn btn-ghost btn-sm" id="resync-thread-btn" onclick="resyncThread()" title="Re-fetch &amp; re-analyze the selected thread" disabled>↺ Resync Thread</button>
+        <button class="btn btn-ghost btn-sm" onclick="reanalyzeAll()" id="reanalyze-btn">⚙ Re-analyze</button>
+      </div>
+    </div>
+  </header>
+  <div class="body">
+    <nav class="sidebar" id="sidebar">
+      <div class="sidebar-scroll">
+        <div id="sidebar-nav">
+          <button class="triage-sidebar-btn" id="triage-sidebar-btn" onclick="openTriageSheet()">📋 Triage Sheet</button>
+          <div class="sidebar-hdr">Folders</div>
+          <div id="folder-tree"></div>
+          <button class="triage-sidebar-btn" id="nav-calendar" onclick="switchTab('calendar')" style="margin-top:8px">📅 Calendar</button>
+          <div class="today-cal" id="today-cal">
+            <div class="today-cal-hdr">Today</div>
+            <div class="week-hours-line" id="week-hours-line"></div>
+            <div id="today-cal-list"><div class="today-cal-empty">Loading…</div></div>
+          </div>
+        </div>
+      </div>
+      <div class="sidebar-footer">
+        <div class="sidebar-counts" id="sidebar-counts"></div>
+        <div class="sidebar-sync-row">
+          <div class="sync-dot" id="sync-dot"></div>
+          <span class="sidebar-sync-txt" id="sync-txt">Connecting…</span>
+          <span id="new-badge-wrap"></span>
+        </div>
+        <div class="sidebar-sync-bar-wrap" id="sync-bar-wrap">
+          <div class="sidebar-sync-bar" id="sync-bar" style="width:0%"></div>
+        </div>
+      </div>
+    </nav>
+    <div class="resize-handle" id="resize-handle"></div>
+    <div class="right-pane" id="right-pane">
+      <div id="first-load">
+        <div class="splash-ascii"> ██████╗██╗      █████╗ ███╗   ██╗██╗  ██╗███████╗██████╗
+██╔════╝██║     ██╔══██╗████╗  ██║██║ ██╔╝██╔════╝██╔══██╗
+██║     ██║     ███████║██╔██╗ ██║█████╔╝ █████╗  ██████╔╝
+██║     ██║     ██╔══██║██║╚██╗██║██╔═██╗ ██╔══╝  ██╔══██╗
+╚██████╗███████╗██║  ██║██║ ╚████║██║  ██╗███████╗██║  ██║
+ ╚═════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝</div>
+        <div class="splash-sub">AI First Collab</div>
+        <div class="splash-tagline">Powered by Claude · Outlook · MCP</div>
+        <div class="splash-loader">
+          <div class="spinner spinner-sm" style="border-top-color:#38bdf8;border-color:#1a3252;border-top-color:#38bdf8"></div>
+          <span id="load-msg">Connecting to inbox</span><span class="splash-dots"><span>.</span><span>.</span><span>.</span></span>
+        </div>
+      </div>
+      <div class="empty-pane" id="empty-pane" style="display:none">
+        <div class="ep-icon">✉</div>
+        <div class="ep-txt">Select a thread to read</div>
+      </div>
+      <div class="thread-detail" id="thread-detail" style="display:none">
+        <div class="thread-hdr" id="thread-hdr"></div>
+        <div class="msgs-section" id="msgs-section"></div>
+      </div>
+      <div class="triage-pane" id="triage-pane" style="display:none"></div>
+      <div class="mailbox-pane" id="mailbox-pane" style="display:none">
+        <div class="mailbox-folder-hdr">
+          <span id="mailbox-folder-name">Select a folder</span>
+          <span class="mailbox-folder-count" id="mailbox-folder-count"></span>
+        </div>
+        <div class="mailbox-list" id="mailbox-list">
+          <div class="mailbox-empty">Select a folder</div>
+        </div>
+        <div class="mbox-kb-hint">
+          <span><kbd>j</kbd><kbd>k</kbd> navigate</span>
+          <span><kbd>Enter</kbd> open</span>
+          <span><kbd>r</kbd> reply</span>
+          <span><kbd>d</kbd> delete</span>
+          <span><kbd>f</kbd> file</span>
+          <span><kbd>u</kbd> mark read</span>
+          <span><kbd>Esc</kbd> back</span>
+        </div>
+      </div>
+      <div class="search-pane" id="search-pane" style="display:none">
+        <div class="search-hdr" id="search-hdr"></div>
+        <div id="search-results"></div>
+      </div>
+      <div class="cal-pane" id="calendar-pane" style="display:none">
+        <div class="cal-nav">
+          <button class="cal-nav-btn" onclick="calMove(-1)">&#8249;</button>
+          <div class="cal-nav-title" id="cal-title"></div>
+          <button class="cal-nav-btn cal-today-btn" onclick="calGoToday()">Today</button>
+          <button class="cal-nav-btn" onclick="calMove(1)">&#8250;</button>
+          <div style="width:1px;background:#1a3252;height:18px;margin:0 2px;flex-shrink:0"></div>
+          <button class="cal-nav-btn cal-view-btn active" id="cal-view-day" onclick="calSetView('day')">Day</button>
+          <button class="cal-nav-btn cal-view-btn" id="cal-view-week" onclick="calSetView('week')">Week</button>
+        </div>
+        <div class="cal-loading" id="cal-loading">Loading calendar…</div>
+        <div class="cal-scroll-wrap" id="cal-scroll-wrap" style="display:none">
+          <div class="cal-grid" id="cal-grid"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Reply modal -->
+<div class="modal-overlay" id="reply-modal">
+  <div class="modal modal-lg">
+    <h3>↩ Reply All</h3>
+    <div class="modal-sub" id="reply-sub"></div>
+    <div class="recip-row">
+      <span class="recip-label">TO</span>
+      <div class="recip-field" id="reply-to-field"></div>
+    </div>
+    <div class="recip-row">
+      <span class="recip-label">CC</span>
+      <div class="recip-field" id="reply-cc-field"></div>
+    </div>
+    <div style="position:relative;margin-top:10px;">
+      <textarea id="reply-body" style="min-height:260px;resize:vertical;width:100%;box-sizing:border-box;padding-right:100px;" placeholder="Generating reply…"></textarea>
+      <div id="reply-generating" style="position:absolute;top:10px;right:10px;font-size:11px;color:#60a5fa;display:none"><div class="spinner spinner-sm" style="display:inline-block;margin-right:4px;vertical-align:middle"></div>Generating…</div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModals()">Cancel</button>
+      <button class="btn btn-ghost btn-sm" onclick="regenerateReply()" id="reply-regen-btn">↺ Regenerate</button>
+      <button class="btn btn-reply" onclick="sendReply()">✉ Send Reply</button>
+    </div>
+  </div>
+</div>
+
+<!-- Compose modal -->
+<div class="modal-overlay" id="compose-modal">
+  <div class="modal modal-xl">
+    <h3>✉ New Message</h3>
+    <div class="recip-row" style="position:relative;">
+      <span class="recip-label">TO</span>
+      <div style="flex:1;position:relative;">
+        <div class="recip-field" id="compose-to-field" style="cursor:text;" onclick="focusComposeInput('to')"></div>
+        <input id="compose-to-input" class="recip-input" type="text" placeholder="Add recipient…" autocomplete="off"
+               oninput="peopleSuggest(this,'to')" onkeydown="peopleSuggestKey(event,'to')">
+        <div class="people-dropdown" id="pd-to"></div>
+      </div>
+    </div>
+    <div class="recip-row" style="position:relative;">
+      <span class="recip-label">CC</span>
+      <div style="flex:1;position:relative;">
+        <div class="recip-field" id="compose-cc-field" style="cursor:text;" onclick="focusComposeInput('cc')"></div>
+        <input id="compose-cc-input" class="recip-input" type="text" placeholder="Add recipient…" autocomplete="off"
+               oninput="peopleSuggest(this,'cc')" onkeydown="peopleSuggestKey(event,'cc')">
+        <div class="people-dropdown" id="pd-cc"></div>
+      </div>
+    </div>
+    <div class="recip-row">
+      <span class="recip-label">Subject</span>
+      <input id="compose-subject" type="text" class="compose-subject-input" placeholder="Subject…">
+    </div>
+    <textarea id="compose-body" style="margin-top:10px;min-height:340px;resize:vertical;width:100%;box-sizing:border-box;" placeholder="Write your message…"></textarea>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModals()">Cancel</button>
+      <button class="btn btn-reply" onclick="sendNewMessage()">✉ Send</button>
+    </div>
+  </div>
+</div>
+
+<!-- File modal -->
+<div class="modal-overlay" id="file-modal">
+  <div class="modal modal-sm">
+    <h3>📁 File Thread</h3>
+    <div class="modal-sub" id="file-sub"></div>
+    <select id="folder-select"></select>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModals()">Cancel</button>
+      <button class="btn btn-file" onclick="fileThread()">File Thread</button>
+    </div>
+  </div>
+</div>
+
+<!-- Delete modal -->
+<div class="modal-overlay" id="delete-modal">
+  <div class="modal modal-sm">
+    <h3>🗑 Delete Thread</h3>
+    <div class="del-subj" id="del-subj"></div>
+    <div class="del-warn">All <span id="del-count"></span> messages will be permanently deleted.</div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModals()">Cancel</button>
+      <button class="btn btn-delete" onclick="confirmDelete()">Delete</button>
+    </div>
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='js/utils.js') }}"></script>
+<script src="{{ url_for('static', filename='js/actions.js') }}"></script>
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+<script src="{{ url_for('static', filename='js/titlebar.js') }}"></script>
+<script src="{{ url_for('static', filename='js/sidebar.js') }}"></script>
+<script src="{{ url_for('static', filename='js/thread.js') }}"></script>
+<script src="{{ url_for('static', filename='js/reply.js') }}"></script>
+<script src="{{ url_for('static', filename='js/compose.js') }}"></script>
+<script src="{{ url_for('static', filename='js/folder.js') }}"></script>
+<script src="{{ url_for('static', filename='js/folder-nav.js') }}"></script>
+<script src="{{ url_for('static', filename='js/triage.js') }}"></script>
+<script src="{{ url_for('static', filename='js/search.js') }}"></script>
+<script src="{{ url_for('static', filename='js/calendar.js') }}"></script>
+</body>
+</html>

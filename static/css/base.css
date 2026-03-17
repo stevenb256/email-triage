@@ -1,0 +1,47 @@
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;font-family:'Monaco','Menlo','Courier New',monospace;}
+html,body{height:100%;background:#0a1628;color:#c9d1d9;overflow:hidden;}
+
+/* Buttons */
+.btn{display:inline-flex;align-items:center;gap:5px;padding:6px 13px;border-radius:7px;font-size:11.5px;font-weight:600;border:none;cursor:pointer;transition:all .15s;white-space:nowrap;font-family:inherit;}
+.btn:hover{filter:brightness(1.12);transform:translateY(-1px);}
+.btn:active{transform:scale(.96) translateY(0);}
+.btn-reply{background:#1f6feb;color:#fff;}
+.btn-file{background:rgba(63,185,80,.15);color:#3fb950;border:1px solid rgba(63,185,80,.3);}
+.btn-delete{background:rgba(248,81,73,.12);color:#f85149;border:1px solid rgba(248,81,73,.25);}
+.btn-ghost{background:#1a3252;color:#8b949e;border:1px solid #243f65;}
+.btn-sm{padding:5px 10px;font-size:11px;}
+.btn-flag{background:rgba(248,81,73,.1);color:#f85149;border:1px solid rgba(248,81,73,.25);}
+.btn-flag.flagged{background:rgba(248,81,73,.25);color:#ff7b72;border-color:rgba(248,81,73,.5);}
+
+/* Loading */
+.spinner{width:28px;height:28px;border:2px solid #21262d;border-top-color:#58a6ff;border-radius:50%;animation:spin .75s linear infinite;}
+.spinner-sm{width:12px;height:12px;border-width:2px;display:inline-block;vertical-align:middle;margin-right:4px;flex-shrink:0;}
+@keyframes spin{to{transform:rotate(360deg);}}
+.load-txt{color:#8b949e;font-size:12px;}
+
+/* Sync dot */
+.sync-dot{width:7px;height:7px;border-radius:50%;background:#3fb950;flex-shrink:0;}
+.sync-dot.syncing{background:#58a6ff;animation:pdot 1s infinite;}
+.sync-dot.error{background:#f85149;}
+@keyframes pdot{0%,100%{opacity:1;transform:scale(1);}50%{opacity:.5;transform:scale(.8);}}
+
+/* New badge */
+.new-badge{display:inline-flex;align-items:center;background:#1f6feb;color:#fff;border-radius:9px;font-size:10px;font-weight:600;padding:1px 7px;animation:bpop .3s cubic-bezier(.34,1.56,.64,1);}
+@keyframes bpop{from{transform:scale(0);opacity:0;}to{transform:scale(1);opacity:1;}}
+.badge-sm{display:inline-flex;align-items:center;padding:2px 8px;border-radius:8px;font-size:10.5px;background:#1a3252;color:#8b949e;}
+
+/* Urgency / action pills */
+.urg-pill{display:inline-flex;align-items:center;padding:2px 9px;border-radius:10px;font-size:9.5px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;}
+.urg-high{background:rgba(248,81,73,.15);color:#f85149;border:1px solid rgba(248,81,73,.3);}
+.urg-medium{background:rgba(210,153,34,.15);color:#d29922;border:1px solid rgba(210,153,34,.3);}
+.urg-low{background:rgba(63,185,80,.12);color:#3fb950;border:1px solid rgba(63,185,80,.25);}
+.act-pill{display:inline-flex;align-items:center;padding:2px 9px;border-radius:10px;font-size:9.5px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;background:#1a3252;color:#8b949e;border:1px solid #243f65;}
+.act-reply{background:rgba(31,111,235,.15);color:#58a6ff;border-color:rgba(88,166,255,.25);}
+.act-delete{background:rgba(248,81,73,.12);color:#f85149;border-color:rgba(248,81,73,.25);}
+.act-file{background:rgba(63,185,80,.1);color:#3fb950;border-color:rgba(63,185,80,.2);}
+
+/* Nav buttons */
+.nav-btns{display:flex;gap:3px;}
+.nav-btn{padding:5px 11px;border-radius:6px;font-size:11.5px;font-weight:600;border:1px solid transparent;background:none;color:#8b949e;cursor:pointer;transition:all .15s;white-space:nowrap;}
+.nav-btn:hover{color:#c9d1d9;background:#1a3252;}
+.nav-btn.active{background:#1a3252;color:#58a6ff;border-color:#58a6ff55;}
