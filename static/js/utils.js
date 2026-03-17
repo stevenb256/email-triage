@@ -102,6 +102,28 @@ function linkify(text) {
   }).join('');
 }
 
+// Render AI summary — handles both legacy plain text and new 3-part format
+// (parts separated by blank lines: FACTS, OPEN QUESTIONS, NEXT ACTION)
+function _renderSummary(summary) {
+  if (!summary) return '';
+  const parts = summary.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+  if (parts.length < 2) {
+    // Legacy single-block summary — just render as-is
+    return `<span>${esc(summary)}</span>`;
+  }
+  const labels = ['📋 Facts', '❓ Open Questions / Blockers', '⚡ Your Next Action'];
+  return parts.map((p, i) => {
+    const label = labels[i] || '';
+    // Render bullet lines as a list if they start with •, -, or *
+    const lines = p.split('\n').map(l => l.trim()).filter(Boolean);
+    const isList = lines.length > 1 && lines.every(l => /^[•\-\*]/.test(l));
+    const body = isList
+      ? `<ul class="sum-list">${lines.map(l => `<li>${esc(l.replace(/^[•\-\*]\s*/,''))}</li>`).join('')}</ul>`
+      : `<span>${esc(p)}</span>`;
+    return `<div class="sum-part"><span class="sum-part-lbl">${label}</span>${body}</div>`;
+  }).join('');
+}
+
 // intent → CSS class suffix
 const INTENT_CLS = {
   'Status Update':'status-update','Request':'request','Decision':'decision',

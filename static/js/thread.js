@@ -58,7 +58,7 @@ function _renderThreadHdr(t) {
       <span class="th-names">${esc(parts.slice(0,4).join(', '))}${parts.length>4?' +'+(parts.length-4):''}</span>
       <span class="th-msgcount">${t.messageCount||0} msg${(t.messageCount||0)!==1?'s':''}</span>
     </div>
-    ${t.summary?`<div class="th-summary"><div class="th-summary-lbl">🤖 AI Summary</div>${esc(t.summary)}</div>`:''}
+    ${t.summary?`<div class="th-summary"><div class="th-summary-lbl">🤖 AI Summary</div><div class="th-summary-body">${_renderSummary(t.summary)}</div></div>`:''}
     <div class="th-actions">
       <button class="btn btn-reply btn-sm" onclick="openReply('${enc}')">↩ Reply</button>
       ${fileBtnHtml}

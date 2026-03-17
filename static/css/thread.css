@@ -11,7 +11,14 @@
 .th-names{font-size:11px;color:#8b949e;margin-left:8px;}
 .th-msgcount{font-size:10px;color:#8b949e;background:#1a3252;border-radius:7px;padding:2px 7px;}
 .th-summary{background:rgba(88,166,255,.05);border:1px solid rgba(88,166,255,.12);border-radius:7px;padding:7px 11px;font-size:11px;color:#8b949e;line-height:1.6;margin-bottom:7px;}
-.th-summary-lbl{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:#58a6ff;margin-bottom:3px;}
+.th-summary-lbl{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:#58a6ff;margin-bottom:5px;}
+.th-summary-body{display:flex;flex-direction:column;gap:7px;}
+.sum-part{display:flex;flex-direction:column;gap:2px;}
+.sum-part-lbl{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:#58a6ff;opacity:.7;}
+.sum-part:last-child .sum-part-lbl{color:#f0a84a;opacity:1;}
+.sum-part:last-child span,.sum-part:last-child li{color:#f0c070;font-weight:600;}
+.sum-list{margin:2px 0 0 12px;padding:0;list-style:disc;display:flex;flex-direction:column;gap:1px;}
+.sum-list li{font-size:11px;color:#8b949e;line-height:1.5;}
 .th-actions{display:flex;gap:6px;flex-wrap:wrap;}
 
 /* Messages section */

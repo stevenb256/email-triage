@@ -71,7 +71,7 @@ function _triageRowHTML(t) {
         <span class="triage-subj">${esc(t.subject||'(No subject)')}</span>
         <span class="action-rec ${rec.cls}">${rec.icon} ${rec.label}</span>
       </div>
-      ${t.summary?`<div class="triage-sum" style="padding-left:17px">${esc(t.summary)}</div>`:''}
+      ${t.summary?`<div class="triage-sum" style="padding-left:17px">${_renderSummary(t.summary)}</div>`:''}
     </div>
     <div class="triage-msgs" id="triage-msgs-${esc(convKey)}" style="${expanded?'':'display:none'}">${msgsHtml}</div>
     <div class="triage-btns">

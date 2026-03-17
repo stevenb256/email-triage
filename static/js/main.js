@@ -39,8 +39,10 @@ async function init() {
   state.collapsedTopics = new Set(state.groups.map(g=>g.topic));
   state.latestTs = d.latestTs;
   const splash = document.getElementById('first-load');
-  splash.classList.add('fade-out');
-  setTimeout(()=>{ splash.style.display='none'; }, 650);
+  setTimeout(() => {
+    splash.classList.add('fade-out');
+    setTimeout(()=>{ splash.style.display='none'; }, 650);
+  }, 1000);
   updateCounts(d.emailCount, Object.keys(state.threadMap).length);
   updateSyncStatus(d.syncStatus);
 
