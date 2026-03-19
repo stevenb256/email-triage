@@ -12,7 +12,7 @@ async function selectThread(convKey) {
   if (!t) return;
   document.getElementById('empty-pane').style.display='none';
   document.getElementById('triage-pane').style.display='none';
-  document.getElementById('triage-sidebar-btn').classList.remove('active');
+  const navTriage = document.getElementById('nav-triage'); if (navTriage) navTriage.classList.remove('active');
   document.getElementById('thread-detail').style.display='flex';
   _renderThreadHdr(t);
   const sec = document.getElementById('msgs-section');
@@ -78,7 +78,7 @@ function _renderMsgs(msgs, t) {
 function _msgCardHTML(m, idx) {
   const from=m.from_name||m.from_address||'Unknown';
   const date=fmtDate((m.received_date_time||'').slice(0,19));
-  const bodyText=String(m.body||m.body_preview||'').trim();
+  const bodyText=decodeEntities(String(m.body||m.body_preview||'')).trim();
   const preview=bodyText.slice(0,100).replace(/\n+/g,' ');
   const isOpen=state.expandedMsgs.has(idx);
   const toList=(m.to_recipients||[]).map(r=>esc(r.name||r.address)).join(', ');
@@ -87,43 +87,52 @@ function _msgCardHTML(m, idx) {
     +(toList?`<span><span class="msg-recip-lbl">To:</span>${toList}</span>`:'')
     +(ccList?`<span><span class="msg-recip-lbl">CC:</span>${ccList}</span>`:'')
     +`</div>`:'';
-  const hasHtml = !!(m.body_html);
-  // Default: HTML view if html available, AI view otherwise. showOriginal[id] overrides.
-  const fmtOriginal = state.showOriginal[m.id] !== undefined ? !!state.showOriginal[m.id] : hasHtml;
-  const fmtBtnLabel = fmtOriginal ? 'AI view' : (hasHtml ? 'HTML' : 'Original');
   return `<div class="msg-card${isOpen?' open':''}" id="mc-${idx}">
     <div class="msg-hdr" onclick="toggleMsg(${idx})">
       <span class="avatar" style="background:${avColor(from)};width:24px;height:24px;font-size:8.5px;border:2px solid #0a1628;flex-shrink:0">${initials(from)}</span>
       <span class="msg-from-wrap"><span class="msg-from">${esc(from)}</span><span class="msg-preview">${esc(preview)}</span></span>
       <span class="msg-date">${esc(date)}</span>
-      <button class="btn btn-ghost btn-sm" id="fmt-btn-${idx}" onclick="(event||window.event).stopPropagation(); toggleFormatView(${idx})">${fmtBtnLabel}</button>
       <a class="msg-owa-link" href="${'https://outlook.office.com/owa/?ItemID='+encodeURIComponent(m.id)+'&exvsurl=1&viewmodel=ReadMessageItem'}" target="_blank" rel="noopener" title="Open in Outlook Web" onclick="event.stopPropagation()">📎</a>
       <span class="msg-chevron">▾</span>
     </div>
     ${recipRow}
-    <div class="msg-body" id="mb-${idx}">${isOpen?_bodyContent(idx):''}
-    </div>
+    <div class="msg-body" id="mb-${idx}">${isOpen?_bodyContent(idx):''}</div>
   </div>`;
 }
 
 function _bodyContent(idx) {
-  const m=state.currentMsgs[idx];
+  const m = state.currentMsgs[idx];
   if (!m) return '';
-  const hasHtml = !!(m.body_html);
-  const showOriginal = state.showOriginal[m.id] !== undefined ? !!state.showOriginal[m.id] : hasHtml;
-  const originalText = String(m.body||m.body_preview||'').trim();
-  if (showOriginal) {
-    if (m.body_html) {
-      const safe = m.body_html.replace(/"/g, '&quot;');
-      return `<iframe sandbox="allow-same-origin" srcdoc="${safe}"
-        style="width:100%;border:none;min-height:200px;display:block;background:#fff;border-radius:4px;"
-        onload="this.style.height=Math.min(700,this.contentDocument.body.scrollHeight+20)+'px'"></iframe>`;
-    }
-    return `<div style="font-size:12px;color:#c9d1d9;line-height:1.8;white-space:pre-wrap">${esc(originalText)}</div>`;
+  if (m.body_html) {
+    const safe = _injectBaseTarget(m.body_html).replace(/"/g, '&quot;');
+    return `<iframe sandbox="allow-same-origin allow-popups" srcdoc="${safe}"
+      style="width:100%;border:none;min-height:200px;display:block;background:#fff;border-radius:4px;"
+      onload="this.style.height=Math.min(700,this.contentDocument.body.scrollHeight+20)+'px'"></iframe>`;
   }
-  if (state.formatCache[m.id]) return _renderParas(state.formatCache[m.id]);
-  setTimeout(()=>loadFormatted(idx),0);
-  return `<div class="stream-wrap" id="sw-${idx}"><span class="stream-cursor"></span></div>`;
+  // No HTML yet — show plain text and fetch in background
+  setTimeout(() => loadMsgHtml(idx), 0);
+  const plain = decodeEntities(String(m.body || m.body_preview || '')).trim();
+  return plain
+    ? `<div style="font-size:12px;color:#c9d1d9;line-height:1.8;white-space:pre-wrap">${esc(plain)}</div>`
+    : `<div style="padding:12px;color:#5ba4cf;font-size:11px"><div class="spinner spinner-sm" style="display:inline-block;margin-right:6px"></div>Loading…</div>`;
+}
+
+function loadMsgHtml(idx) {
+  const m = state.currentMsgs[idx];
+  if (!m || m.body_html) return;
+  const es = new EventSource(`/api/format_message_stream?id=${encodeURIComponent(m.id)}`);
+  es.onmessage = (evt) => {
+    const data = JSON.parse(evt.data);
+    if (data.type === 'done') {
+      es.close();
+      if (data.body_html) {
+        m.body_html = data.body_html;
+        const bodyEl = document.getElementById('mb-'+idx);
+        if (bodyEl && state.expandedMsgs.has(idx)) bodyEl.innerHTML = _bodyContent(idx);
+      }
+    }
+  };
+  es.onerror = () => es.close();
 }
 
 function toggleMsg(idx) {
@@ -183,15 +192,25 @@ function loadFormatted(idx) {
     } else if (data.type==='done') {
       es.close();
       state.formatCache[m.id]=data.paragraphs||[];
-      // Only overwrite the body with AI view if the user hasn't switched to Original
-      if (bodyEl&&state.expandedMsgs.has(idx) && !state.showOriginal[m.id]) bodyEl.innerHTML=_renderParas(state.formatCache[m.id]);
+      // Store body_html on the message object so HTML view works
+      if (data.body_html) {
+        m.body_html = data.body_html;
+        // Default to HTML view on first open if we now have HTML
+        if (state.showOriginal[m.id] === undefined) state.showOriginal[m.id] = true;
+        const btn = document.getElementById('fmt-btn-'+idx);
+        if (btn) btn.textContent = 'AI view';
+      }
+      if (bodyEl && state.expandedMsgs.has(idx)) {
+        bodyEl.innerHTML = _bodyContent(idx);
+        if (!state.showOriginal[m.id] && !state.formatCache[m.id].length) loadFormatted(idx);
+      }
     }
   };
 
   es.onerror=()=>{
     es.close();
     if (bodyEl&&state.expandedMsgs.has(idx)) {
-      const fallback=String(m.body||m.body_preview||'').trim();
+      const fallback=decodeEntities(String(m.body||m.body_preview||'')).trim();
       bodyEl.innerHTML=`<div style="font-size:12px;color:#c9d1d9;line-height:1.8;white-space:pre-wrap">${esc(fallback)}</div>`;
     }
   };

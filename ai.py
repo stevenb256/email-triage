@@ -1,5 +1,5 @@
 """
-ai.py — All Claude AI calls for Clanker email triage app.
+ai.py — All Claude AI calls for Outlook Express email triage app.
 """
 import json
 import re
@@ -55,6 +55,11 @@ def _get_full_body(email: dict) -> str:
         if len(plain) > 100:
             return _clean(plain, 8000)
 
+    # 2.5 body_preview — if it's substantial, it's a previously cached full body (skip MCP)
+    bp = email.get("body_preview", "")
+    if bp and len(bp) > 300:
+        return _clean(bp, 8000)
+
     # 3. Fetch full message from Outlook MCP — returns body_content (HTML string) directly
     msg_id = email.get("id", "")
     if msg_id:
@@ -78,11 +83,20 @@ def _get_full_body(email: dict) -> str:
                     plain = re.sub(r'[ \t]{2,}', ' ', plain)
                     plain = re.sub(r'\n{3,}', '\n\n', plain).strip()
                     if len(plain) > 50:
-                        return _clean(plain, 8000)
+                        full = _clean(plain, 8000)
+                        # Cache full body back to DB so re-analyze doesn't need MCP
+                        try:
+                            from db import get_db
+                            _db = get_db()
+                            _db.execute("UPDATE emails SET body_preview=? WHERE id=?", (full, msg_id))
+                            _db.commit()
+                        except Exception:
+                            pass
+                        return full
         except Exception as ex:
             print(f"  _get_full_body fetch failed for {msg_id[:20]}: {ex}")
 
-    # 4. body_preview is all we have
+    # 4. body_preview is all we have (short Outlook preview, ~255 chars)
     return _clean(email.get("body_preview", "(no content)"), 2000)
 
 
@@ -96,6 +110,22 @@ def _get_ai():
     if _ai is None:
         _ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     return _ai
+
+
+def _extract_fields_regex(json_str: str) -> dict:
+    """Last-resort field extraction when JSON is unparseable."""
+    def _grab(key):
+        # Match "key": "value" with any content including newlines
+        m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', json_str, re.DOTALL)
+        return m.group(1).replace('\\n', '\n').replace('\\"', '"') if m else ""
+    return {
+        "summary":       _grab("summary"),
+        "topic":         _grab("topic"),
+        "action":        _grab("action") or "read",
+        "urgency":       _grab("urgency") or "low",
+        "suggestedReply":_grab("suggestedReply"),
+        "suggestedFolder":_grab("suggestedFolder"),
+    }
 
 
 # ─── AI functions ──────────────────────────────────────────────────────────────
@@ -132,21 +162,22 @@ def analyze_thread(emails: list, efforts_folders: list, other_folders: list, rep
     subject = _clean(emails[-1].get("subject", "(no subject)"), 100)
 
     # Build topic guidance — existing topics let Claude reuse groups instead of fragmenting
+    _topic_base = (
+        " Use the product or project name only — strip out the specific activity or issue."
+        " Good examples: 'Knowledge Anchors', 'ODSP', 'FaceAI', 'SPAI', 'NGIA', 'OneDrive',"
+        " 'SharePoint Copilot', 'Lists', 'DocLab'. Bad (too specific): 'Knowledge Anchors Scenario"
+        " Ownership', 'ODSP Experimentation Pipelines'. Bad (too generic): 'Engineering',"
+        " 'FYI & Updates', 'Strategy'. Aim for the level where 3-6 related threads would share"
+        " the same label. 1-3 words, title case."
+    )
     if existing_topics:
         existing_list = ", ".join(f'"{t}"' for t in sorted(set(existing_topics))[:30])
         topic_guidance = (
-            f"\nEXISTING TOPICS (reuse one if it fits — exact match required): {existing_list}"
-            f"\nIf none fit, create a NEW topic: 2-4 words, project/initiative focused "
-            f"(e.g. 'SharePoint Copilot', 'GPU Migration', 'Search Evaluation', 'Team Hiring'). "
-            f"Not too broad ('Engineering') and not too narrow ('RE: GPU ticket #4821'). "
-            f"Use title case. Do not add qualifiers like 'Thread' or 'Discussion'."
+            f"\nEXISTING TOPICS (reuse if this thread belongs to the same product/project): {existing_list}"
+            f"\nPrefer reusing an existing topic over creating a new one.{_topic_base}"
         )
     else:
-        topic_guidance = (
-            "\nCreate a topic: 2-4 words, project/initiative focused "
-            "(e.g. 'SharePoint Copilot', 'GPU Migration', 'Search Evaluation', 'Team Hiring'). "
-            "Not too broad ('Engineering') and not too narrow. Use title case."
-        )
+        topic_guidance = f"\nCreate a product/project-level topic.{_topic_base}"
 
     prompt = f"""You are a world-class executive communication assistant for a senior engineering/product leader at a large tech company.
 Analyze this email thread and return ONLY valid JSON.
@@ -215,8 +246,8 @@ INSTRUCTIONS:
 
 Return ONLY this JSON (no markdown fences, no explanation):
 {{
-  "summary": "REQUIRED FORMAT — write exactly 3 parts separated by a blank line:\\n\\nPART 1 — FACTS (2-4 sentences): Report only verifiable facts from the thread. Name every person by first and last name and their role. State exact numbers, dates, system names, project names, metrics, decisions, blockers, and deadlines. Quote or closely paraphrase the specific ask or decision verbatim. If a number or date was mentioned, it must appear here. Zero vagueness — 'progress was shared' is wrong; 'latency dropped from 420ms to 180ms' is right.\\n\\nPART 2 — OPEN QUESTIONS / BLOCKERS (1-3 bullets): List every unanswered question, unresolved decision, or blocker explicitly stated or implied in the thread. If none, write 'None'.\\n\\nPART 3 — YOUR NEXT ACTION (1 sentence): Tell the reader exactly what they need to do and by when. Be imperative and specific: 'Reply to Jane by EOD approving the Q3 budget increase to $2.4M' or 'No action needed — file for reference' or 'Read and acknowledge — Liu is waiting on your signal to proceed'.",
-  "topic": "project/initiative label — reuse an existing topic if it fits, otherwise 2-4 words like 'SharePoint Copilot' or 'GPU Migration'",
+  "summary": "Write exactly 3 sections separated by the literal token ||BREAK||. No actual newlines inside this string. Section 1 — FACTS: 2-4 sentences, verifiable facts only. Name every person by full name. State exact numbers, dates, systems, metrics, decisions, blockers. Section 2 — OPEN QUESTIONS: 1-3 short bullet items (use • prefix), or 'None'. Section 3 — NEXT ACTION: 1 imperative sentence, e.g. 'Reply to Jane Bailey by EOD approving the $2.4M budget' or 'No action needed, file for reference'.",
+  "topic": "product/project name only, 1-3 words — e.g. 'Knowledge Anchors', 'ODSP', 'FaceAI', 'SPAI'. Strip the specific activity. Reuse an existing topic if this thread belongs to the same product.",
   "action": "reply OR delete OR file OR read OR done",
   "urgency": "high OR medium OR low",
   "suggestedReply": "complete draft reply or empty string only if deleting",
@@ -238,8 +269,24 @@ Return ONLY this JSON (no markdown fences, no explanation):
         m = re.search(r'\{[\s\S]*\}', raw)
         if not m:
             raise ValueError(f"No JSON found: {raw[:200]}")
-        result = json.loads(m.group())
-        result["topic"] = _normalize_topic(result.get("topic", ""))
+        json_str = m.group()
+        try:
+            result = json.loads(json_str)
+        except json.JSONDecodeError:
+            # Haiku sometimes emits literal newlines inside string values — fix and retry
+            fixed = re.sub(r'\n', ' ', json_str)
+            try:
+                result = json.loads(fixed)
+            except json.JSONDecodeError:
+                # Last resort: extract each field with regex
+                result = _extract_fields_regex(json_str)
+        raw_topic = result.get("topic", "")
+        result["topic"] = _normalize_topic(raw_topic)
+        print(f"  [topic] raw={raw_topic!r} → {result['topic']!r}")
+        # Sanitize suggestedFolder — reject placeholder-like values
+        sf = result.get("suggestedFolder") or ""
+        if re.match(r'^(select(\s+folder)?|choose|pick|none|n\/a|folder|tbd|unknown|\s*)$', sf.strip(), re.IGNORECASE):
+            result["suggestedFolder"] = ""
         return result
     except Exception as ex:
         print(f"  Analysis error: {ex}")
@@ -298,6 +345,28 @@ def format_message_ai(msg: dict) -> list:
         print(f"  Format error: {ex}")
         paras = [p.strip() for p in body.split('\n\n') if p.strip()][:20]
         return [{"text": p, "intent": "FYI", "emoji": "📄", "fact_concern": None} for p in paras]
+
+
+def summarize_message_ai(msg: dict) -> str:
+    """Return a short 1-sentence summary of the message body for triage view."""
+    body = _get_full_body(msg)
+    from_name = msg.get("from_name") or msg.get("from_address") or "Unknown"
+    if not body.strip() or body == "(no content)":
+        return ""
+    prompt = (
+        f"From: {from_name}\n\n{body[:3000]}\n\n"
+        "Write a single concise sentence (max 20 words) summarising the key point or ask of this email. "
+        "Be specific — mention names, numbers, or decisions if relevant. Reply with ONLY the sentence, no punctuation at the end."
+    )
+    try:
+        resp = _get_ai().messages.create(
+            model=ANALYSIS_MODEL,
+            max_tokens=80,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text.strip().rstrip(".")
+    except Exception:
+        return ""
 
 
 def generate_reply_ai(subject: str, msgs_text: str, user_prompt: str) -> str:

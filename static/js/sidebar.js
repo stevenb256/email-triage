@@ -1,7 +1,11 @@
 // ── Sidebar ────────────────────────────────────────────────────────────────────
 function renderSidebar() {
-  // Topic list removed; sidebar now shows folder tree (via initMailbox).
-  // Highlight active thread in folder tree if applicable.
+  // Update triage count badge
+  const countEl = document.getElementById('triage-count');
+  if (countEl) {
+    const n = Object.keys(state.threadMap).length;
+    countEl.textContent = n > 0 ? n : '';
+  }
 }
 function _threadItemHTML(t) {
   const active = t.conversationKey===state.selectedKey;
@@ -33,7 +37,11 @@ async function initMailbox() {
     const cnt = f.count ? `<span class="folder-item-count">${f.count.toLocaleString()}</span>` : '';
     return `<div class="folder-item" data-folder="${esc(path)}" onclick="selectMailboxFolder('${esc(path)}',this)"><span>${f.icon}</span><span class="folder-item-name">${esc(f.name)}</span>${cnt}</div>`;
   };
-  tree.innerHTML = r.folders.map(f => {
+  const triageCount = Object.keys(state.threadMap).length;
+  const triageItem = `<div class="folder-item" id="nav-triage" onclick="openTriageSheet()"><span>📋</span><span class="folder-item-name">Triage</span>${triageCount > 0 ? `<span class="folder-item-count" id="triage-count">${triageCount}</span>` : `<span class="folder-item-count" id="triage-count"></span>`}</div>`;
+  const calItem = `<div class="folder-item" id="nav-calendar" onclick="switchTab('calendar')"><span>📅</span><span class="folder-item-name">Calendar</span></div>`;
+
+  const folderHtml = r.folders.map(f => {
     if (f.children && f.children.length) {
       return `<div>
         <div class="folder-group-hdr" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')">
@@ -46,45 +54,81 @@ async function initMailbox() {
       </div>`;
     }
     return fItem(f, f.name);
-  }).join('');
+  });
+
+  // Insert calendar after Archive, or after the last non-system folder
+  const archiveIdx = r.folders.findIndex(f => f.name === 'Archive');
+  const calIdx = archiveIdx >= 0 ? archiveIdx + 1 : r.folders.findIndex(f => f.name === 'Deleted Items');
+  if (calIdx >= 0) {
+    folderHtml.splice(calIdx, 0, calItem);
+  } else {
+    folderHtml.push(calItem);
+  }
+
+  tree.innerHTML = triageItem + folderHtml.join('');
+  loadTopContacts();
 }
 
+
 // ── Today calendar widget ──────────────────────────────────────────────────────
+let _todayCalOffset = 0; // 0 = today, -1 = yesterday, +1 = tomorrow, etc.
+
+function todayCalMove(delta) {
+  _todayCalOffset += delta;
+  renderTodayCal();
+}
+
 async function renderTodayCal() {
-  const today = new Date();
-  const start = new Date(today); start.setHours(0,0,0,0);
-  const end   = new Date(today); end.setHours(23,59,59,0);
+  const base = new Date();
+  base.setDate(base.getDate() + _todayCalOffset);
+  const start = new Date(base); start.setHours(0,0,0,0);
+  const end   = new Date(base); end.setHours(23,59,59,0);
   const startISO = start.toISOString().slice(0,19);
   const endISO   = end.toISOString().slice(0,19);
+
+  // Update header label
+  const dateEl = document.getElementById('today-cal-date');
+  if (dateEl) {
+    if (_todayCalOffset === 0) {
+      const now = new Date();
+      const dow  = now.toLocaleDateString([],{weekday:'short'});
+      const mo   = now.toLocaleDateString([],{month:'short'});
+      const day  = now.getDate();
+      const time = now.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'});
+      dateEl.textContent = `${dow} ${mo} ${day} · ${time}`;
+    } else {
+      dateEl.textContent = base.toLocaleDateString([],{weekday:'short',month:'short',day:'numeric'});
+    }
+  }
+
   let events = [];
   try {
     const r = await fetch(`/api/calendar?start=${encodeURIComponent(startISO)}&end=${encodeURIComponent(endISO)}`);
     const d = await r.json();
     events = (d.events||[]).filter(ev => {
-      // exclude all-day (no time component or midnight-to-midnight)
       const st = ev.start_time||'';
       return st.length > 10 && !/T00:00:00/.test(st);
     });
   } catch(e) {}
   const list = document.getElementById('today-cal-list');
   if (!list) return;
-  if (!events.length) { list.innerHTML = '<div class="today-cal-empty">No meetings today</div>'; return; }
+  if (!events.length) { list.innerHTML = '<div class="today-cal-empty">No meetings</div>'; return; }
   function evDotColor(subj) {
     let h=0; for(const c of subj) h=(h*31+c.charCodeAt(0))&0xffff;
     return CAL_COLORS[h % CAL_COLORS.length][1];
   }
+  const now = new Date();
   list.innerHTML = events.map(ev => {
     const st = new Date(ev.start_time);
     const timeStr = st.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'});
     const color = evDotColor(ev.subject||'');
-    const past = st < today;
+    const past = _todayCalOffset < 0 || (_todayCalOffset === 0 && st < now);
     return `<div class="today-ev" style="${past?'opacity:.45':''}">
       <div class="today-ev-dot" style="background:${color}"></div>
       <span class="today-ev-time">${timeStr}</span>
       <span class="today-ev-title" title="${esc(ev.subject)}">${esc(ev.subject||'(No title)')}</span>
     </div>`;
   }).join('');
-  // Also update week hours
   updateWeekHours();
 }
 
@@ -144,7 +188,7 @@ async function selectMailboxFolder(folder, el) {
           <span class="mbox-from">${esc(t.fromName||t.fromAddress)}</span>
           <span class="mbox-date">${esc(fmtDate(t.date))}</span>
         </div>
-        <div class="mbox-preview">${esc(t.preview)}</div>
+        <div class="mbox-preview">${esc(decodeEntities(t.preview))}</div>
       </div>
       ${t.messageCount>1?`<div class="mbox-cnt">${t.messageCount}</div>`:''}
       <div class="mbox-actions" onclick="event.stopPropagation()">
@@ -155,4 +199,23 @@ async function selectMailboxFolder(folder, el) {
   }).join('');
   _mboxFocusIdx = -1;
   _mboxRegisterKeys();
+}
+
+// ── Top Collaborators widget ───────────────────────────────────────────────────
+async function loadTopContacts() {
+  const list = document.getElementById('top-contacts-list');
+  if (!list) return;
+  const r = await fetch('/api/top_contacts?n=10').then(r=>r.json()).catch(()=>null);
+  if (!r || !r.contacts || !r.contacts.length) {
+    list.innerHTML = '<div class="top-contacts-loading">No data yet</div>';
+    return;
+  }
+  list.innerHTML = r.contacts.map(c => {
+    const name = c.name || c.email;
+    return `<div class="top-contact-row" title="${esc(c.email)}">
+      <span class="top-contact-av" style="background:${avColor(name)}">${initials(name)}</span>
+      <span class="top-contact-name">${esc(name)}</span>
+      <span class="top-contact-freq">${c.frequency}</span>
+    </div>`;
+  }).join('');
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-app.py — Thin entry point for Clanker email triage app.
+app.py — Thin entry point for Outlook Express email triage app.
 Imports modules, registers blueprints, starts sync thread, serves index.html.
 """
 import threading
@@ -9,7 +9,7 @@ import webbrowser
 from flask import Flask, render_template
 
 from config import PORT
-from db import init_db
+from db import init_db, rebuild_contacts, get_my_email
 from mcp_client import call_tool, _session_ready
 from sync import _sync_loop
 from db import meta_set
@@ -50,6 +50,7 @@ if __name__ == "__main__":
         print("\n⚠  ANTHROPIC_API_KEY not set in .env\n")
 
     init_db()
+    threading.Thread(target=lambda: rebuild_contacts(get_my_email()), daemon=True, name="contacts-build").start()
     print(f"\n📧 Email Triage starting at http://localhost:{PORT}")
 
     _session_ready.wait(timeout=20)

@@ -21,10 +21,14 @@ async function openDelete(enc) {
 }
 
 function closeModals() {
+  const wasReplyFromTriage = _replyState && _replyState.fromTriage;
   document.querySelectorAll('.modal-overlay').forEach(m=>m.classList.remove('open'));
   _activeThread=null;
+  if (_replyState) _replyState.fromTriage = false;
   // Close any open people dropdowns
   document.querySelectorAll('.people-dropdown').forEach(d=>d.classList.remove('open'));
+  // Restore triage view if reply was opened from triage
+  if (wasReplyFromTriage) openTriageSheet();
 }
 
 async function fileThread() {

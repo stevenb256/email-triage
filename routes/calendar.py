@@ -1,5 +1,5 @@
 """
-routes/calendar.py — Calendar API routes for Clanker.
+routes/calendar.py — Calendar API routes for Outlook Express.
 """
 import json
 import re

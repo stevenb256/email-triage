@@ -4,8 +4,7 @@ let state = {
   threadMap: {},
   selectedKey: null,
   collapsedTopics: new Set(),
-  formatCache: {},        // msgId → [{text,intent,emoji,fact_concern}]
-  expandedMsgs: new Set(),// indices of expanded messages
+  expandedMsgs: new Set(),// indices of expanded messages in thread-detail view
   currentMsgs: [],        // messages for selected thread (newest-first)
   latestTs: '',
   folders: [],
@@ -18,7 +17,8 @@ let state = {
   triageFocusIdx: -1,
   expandedTriageRows: new Set(),
   triageMsgCache: {},
-  showOriginal: {},       // msgId -> true to show original text instead of AI-formatted
+  triageExpandedMsgs: {}, // convKey → Set of expanded msg indices
+  triageMsgSummaries: {}, // msgId → summary string (or '' if done, null if pending)
 };
 let _activeThread = null;
 let MY_EMAIL = '';
@@ -110,7 +110,8 @@ function switchTab(tab) {
   clearSearch();
   if (state.triageView) { state.triageView = false; document.removeEventListener('keydown', _triageKeydown); }
   if (tab !== 'mailbox') _mboxUnregisterKeys();
-  // Calendar sidebar button highlight
+  // Sidebar nav highlight — clear all folder items then re-apply
+  document.querySelectorAll('.folder-item.active').forEach(e=>e.classList.remove('active'));
   const calBtn = document.getElementById('nav-calendar');
   if (calBtn) calBtn.classList.toggle('active', tab==='calendar');
   // Title bar actions always visible
@@ -174,5 +175,15 @@ function showToast(msg, isError=false) {
 // ── Modal overlay close on background click ────────────────────────────────────
 document.querySelectorAll('.modal-overlay').forEach(m=>
   m.addEventListener('click',e=>{if(e.target===m)closeModals();}));
+
+// ── Global Escape key closes open modals ────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  // Don't interfere with people dropdown Escape (handled in compose.js)
+  const openDropdown = document.querySelector('.people-dropdown.open');
+  if (openDropdown) return;
+  const openModal = document.querySelector('.modal-overlay.open');
+  if (openModal) { e.preventDefault(); closeModals(); }
+});
 
 init();

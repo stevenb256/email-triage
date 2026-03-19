@@ -1,5 +1,5 @@
 """
-routes/mail.py — Mail-related API routes for Clanker.
+routes/mail.py — Mail-related API routes for Outlook Express.
 """
 import json
 import re
@@ -7,12 +7,23 @@ from datetime import datetime, timezone
 
 from flask import Blueprint, Response, jsonify, request, stream_with_context
 
-from db import get_db, meta_get, remove_thread, get_my_email
+from db import get_db, meta_get, remove_thread, get_my_email, rebuild_contacts
 from mcp_client import call_tool
-from ai import format_message_ai, generate_reply_ai, _format_prompt, _parse_format_response, _get_ai
+from ai import format_message_ai, generate_reply_ai, summarize_message_ai, _format_prompt, _parse_format_response, _get_ai
 from config import ANALYSIS_MODEL
 
 bp = Blueprint("mail", __name__)
+
+_BLANK_GIF = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+
+
+def _embed_cid_images(html: str) -> str:
+    """Replace cid: and external http(s): image src refs with placeholders."""
+    # Replace unresolved cid: refs with blank gif
+    html = re.sub(r'src=(["\'])cid:[^"\']*\1', lambda m: f'src={m.group(1)}{_BLANK_GIF}{m.group(1)}', html, flags=re.IGNORECASE)
+    # Replace external http(s) image srcs with blank gif (no credentials needed)
+    html = re.sub(r'src=(["\'])https?://[^"\']*\1', lambda m: f'src={m.group(1)}{_BLANK_GIF}{m.group(1)}', html, flags=re.IGNORECASE)
+    return html
 
 
 def _utcnow() -> str:
@@ -97,9 +108,6 @@ def _normalize_msg(m: dict) -> dict:
         h = re.sub(r'<style\b[^>]*>.*?</style>', lambda mo: mo.group(), h, flags=re.IGNORECASE | re.DOTALL)
         h = re.sub(r'\s+on\w+="[^"]*"', '', h, flags=re.IGNORECASE)
         h = re.sub(r"\s+on\w+='[^']*'", '', h, flags=re.IGNORECASE)
-        h = re.sub(r'src=["\']cid:[^"\']*["\']',
-                   'src="" alt="[inline image — not available]" style="display:inline-block;padding:4px 8px;background:#eee;color:#666;font-size:11px;border-radius:3px"',
-                   h, flags=re.IGNORECASE)
         body_html = h
 
     return {
@@ -146,7 +154,14 @@ def api_thread_messages():
     ).fetchall()
     db_msgs = {r["id"]: dict(r) for r in rows}
 
-    result = [_normalize_msg(db_msgs.get(msg_id, {"id": msg_id})) for msg_id in ids]
+    result = []
+    for msg_id in ids:
+        db_row = db_msgs.get(msg_id, {"id": msg_id})
+        msg = _normalize_msg(db_row)
+        # Include cached body_html from DB if the stream endpoint has already fetched it
+        if not msg.get("body_html") and isinstance(db_row, dict) and db_row.get("body_html"):
+            msg["body_html"] = db_row["body_html"]
+        result.append(msg)
     result.sort(key=lambda m: m.get("received_date_time", ""), reverse=True)
     return jsonify({"messages": result})
 
@@ -194,18 +209,27 @@ def api_format_message_stream():
     db = get_db()
     row = db.execute("SELECT * FROM emails WHERE id=?", (msg_id,)).fetchone()
 
-    # Serve from cache immediately as a single done event
+    # Serve from cache immediately as a single done event (include body_html if cached)
     if row and row["formatted_body"]:
         try:
             paras = json.loads(row["formatted_body"])
+            cached_html = row["body_html"] or ""
+            # Replace any cid:/external image refs with placeholders
+            if cached_html:
+                cached_html = _embed_cid_images(cached_html)
+                try:
+                    db.execute("UPDATE emails SET body_html=? WHERE id=?", (cached_html, msg_id))
+                    db.commit()
+                except Exception:
+                    pass
             def _cached():
-                yield f"data: {json.dumps({'type':'done','paragraphs':paras})}\n\n"
+                yield f"data: {json.dumps({'type':'done','paragraphs':paras,'body_html':cached_html})}\n\n"
             return Response(stream_with_context(_cached()), mimetype="text/event-stream",
                             headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
         except Exception:
             pass
 
-    # Fetch full message body
+    # Fetch full message body from Outlook
     fallback = dict(row) if row else {"id": msg_id}
     try:
         resp = call_tool("outlook_mail_get_message", {"message_id": msg_id})
@@ -216,17 +240,33 @@ def api_format_message_stream():
         else:
             raw = fallback
         msg = _normalize_msg(raw)
+        _bc = raw.get("body_content","") if isinstance(raw,dict) else ""
+        print(f"DEBUG body_content[0:200]: {_bc[:200]!r}")
     except Exception:
         msg = _normalize_msg(fallback)
 
+    body_html = msg.get("body_html") or ""
+    print(f"DEBUG body_html[0:200]: {body_html[:200]!r}")
+    # Embed CID inline images as base64 data URIs
+    if body_html:
+        body_html = _embed_cid_images(body_html)
+    print(f"DEBUG after embed body_html[0:200]: {body_html[:200]!r}")
     body = (msg.get("body") or msg.get("body_preview") or "").strip()
     from_name = msg.get("from_name") or msg.get("from_address") or "Unknown"
     date = (msg.get("received_date_time") or "")[:10]
 
+    # Persist body_html to DB so it's available immediately on future opens
+    if row and body_html:
+        try:
+            db.execute("UPDATE emails SET body_html=? WHERE id=?", (body_html, msg_id))
+            db.commit()
+        except Exception:
+            pass
+
     if not body:
         def _empty():
             paras = [{"text": "(no content)", "intent": "FYI", "emoji": "📭", "fact_concern": None}]
-            yield f"data: {json.dumps({'type':'done','paragraphs':paras})}\n\n"
+            yield f"data: {json.dumps({'type':'done','paragraphs':paras,'body_html':body_html})}\n\n"
         return Response(stream_with_context(_empty()), mimetype="text/event-stream",
                         headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
@@ -248,7 +288,7 @@ def api_format_message_stream():
             print(f"  Stream format error: {ex}")
             paras = [{"text": p.strip(), "intent": "FYI", "emoji": "📄", "fact_concern": None}
                      for p in body.split('\n\n') if p.strip()][:20]
-            yield f"data: {json.dumps({'type':'done','paragraphs':paras})}\n\n"
+            yield f"data: {json.dumps({'type':'done','paragraphs':paras,'body_html':body_html})}\n\n"
             return
 
         try:
@@ -266,10 +306,60 @@ def api_format_message_stream():
             except Exception:
                 pass
 
-        yield f"data: {json.dumps({'type':'done','paragraphs':paras})}\n\n"
+        yield f"data: {json.dumps({'type':'done','paragraphs':paras,'body_html':body_html})}\n\n"
 
     return Response(_stream(), mimetype="text/event-stream",
                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+
+@bp.route("/api/summarize_message")
+def api_summarize_message():
+    msg_id = request.args.get("id", "")
+    if not msg_id:
+        return jsonify({"error": "id required"}), 400
+    db = get_db()
+    row = db.execute("SELECT * FROM emails WHERE id=?", (msg_id,)).fetchone()
+    msg = dict(row) if row else {"id": msg_id}
+    summary = summarize_message_ai(msg)
+    return jsonify({"summary": summary})
+
+
+@bp.route("/api/message_recipients")
+def api_message_recipients():
+    """Fetch to/cc recipients for a specific message from Outlook MCP."""
+    msg_id = request.args.get("id", "")
+    if not msg_id:
+        return jsonify({"to": [], "cc": []})
+    try:
+        resp = call_tool("outlook_mail_get_message", {"message_id": msg_id})
+        raw = None
+        if isinstance(resp, dict) and resp.get("messages"):
+            raw = resp["messages"][0]
+        elif isinstance(resp, dict):
+            raw = resp
+        if not raw:
+            return jsonify({"to": [], "cc": []})
+        msg = _normalize_msg(raw)
+        return jsonify({"to": msg.get("to_recipients", []), "cc": msg.get("cc_recipients", [])})
+    except Exception as e:
+        return jsonify({"to": [], "cc": [], "error": str(e)})
+
+
+@bp.route("/api/top_contacts")
+def api_top_contacts():
+    n = int(request.args.get("n", 10))
+    db = get_db()
+    rows = db.execute(
+        "SELECT email, name, frequency FROM contacts ORDER BY frequency DESC LIMIT ?", (n,)
+    ).fetchall()
+    return jsonify({"contacts": [dict(r) for r in rows]})
+
+
+@bp.route("/api/rebuild_contacts", methods=["POST"])
+def api_rebuild_contacts():
+    my_email = get_my_email()
+    count = rebuild_contacts(my_email)
+    return jsonify({"ok": True, "count": count})
 
 
 @bp.route("/api/reply/<latest_id>", methods=["POST"])

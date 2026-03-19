@@ -1,5 +1,5 @@
 """
-db.py — Database layer for Clanker email triage app.
+db.py — Database layer for Outlook Express email triage app.
 """
 import json
 import sqlite3
@@ -67,6 +67,12 @@ def init_db():
         raw_json        TEXT,
         synced_at       TEXT
     );
+    CREATE TABLE IF NOT EXISTS contacts (
+        email       TEXT PRIMARY KEY,
+        name        TEXT,
+        frequency   INTEGER DEFAULT 0,
+        last_seen   TEXT
+    );
     CREATE INDEX IF NOT EXISTS idx_emails_conv_key ON emails(conversation_key);
     CREATE INDEX IF NOT EXISTS idx_threads_updated  ON threads(updated_at);
     CREATE INDEX IF NOT EXISTS idx_threads_urgency  ON threads(urgency);
@@ -78,6 +84,7 @@ def init_db():
         "ALTER TABLE emails ADD COLUMN formatted_body TEXT",
         "ALTER TABLE threads ADD COLUMN is_flagged INTEGER DEFAULT 0",
         "ALTER TABLE emails ADD COLUMN folder TEXT",
+        "ALTER TABLE emails ADD COLUMN body_html TEXT",
     ]:
         try:
             db.execute(migration)
@@ -141,6 +148,47 @@ def _thread_to_dict(row) -> dict:
         "latestReceived":  d["latest_received"] or "",
         "updatedAt":       d["updated_at"] or "",
     }
+
+
+def rebuild_contacts(my_email: str = ""):
+    """
+    Rebuild the contacts table from all emails in the DB.
+    Groups by lower-cased from_address, picks the most common display name,
+    counts frequency, and records the most recent email date.
+    Excludes the current user's own address.
+    """
+    db = get_db()
+    my_lower = (my_email or "").lower().strip()
+    rows = db.execute("""
+        SELECT LOWER(from_address) AS addr,
+               from_name,
+               COUNT(*) AS cnt,
+               MAX(received_date_time) AS last_seen
+        FROM emails
+        WHERE from_address != ''
+        GROUP BY LOWER(from_address), from_name
+        ORDER BY LOWER(from_address), cnt DESC
+    """).fetchall()
+
+    # Aggregate: pick the most frequent display name per address
+    agg = {}  # addr -> {name, freq, last_seen}
+    for row in rows:
+        addr = row["addr"]
+        if not addr or addr == my_lower:
+            continue
+        if addr not in agg:
+            agg[addr] = {"name": row["from_name"] or addr, "freq": 0, "last_seen": ""}
+        agg[addr]["freq"] += row["cnt"]
+        if (row["last_seen"] or "") > agg[addr]["last_seen"]:
+            agg[addr]["last_seen"] = row["last_seen"] or ""
+
+    db.execute("DELETE FROM contacts")
+    db.executemany(
+        "INSERT INTO contacts(email, name, frequency, last_seen) VALUES(?,?,?,?)",
+        [(addr, v["name"], v["freq"], v["last_seen"]) for addr, v in agg.items()]
+    )
+    db.commit()
+    return len(agg)
 
 
 def remove_thread(conv_key: str):

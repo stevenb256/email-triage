@@ -5,6 +5,8 @@ function openTriageSheet() {
   state.selectedKey = null;
   document.getElementById('empty-pane').style.display='none';
   document.getElementById('thread-detail').style.display='none';
+  document.querySelectorAll('.folder-item.active').forEach(e=>e.classList.remove('active'));
+  const navTriage = document.getElementById('nav-triage'); if (navTriage) navTriage.classList.add('active');
   const pane = document.getElementById('triage-pane');
   pane.style.display='flex';
   // Attach delegated click handler once
@@ -38,13 +40,6 @@ function _triagePaneClick(e) {
   if (summary) {
     const row = summary.closest('[data-convkey]');
     if (row) triageToggleExpand(row.dataset.convkey);
-    return;
-  }
-  // Inline message row toggle
-  const msgRow = e.target.closest('[data-triage-msg]');
-  if (msgRow) {
-    const row = msgRow.closest('[data-convkey]');
-    if (row) triageToggleMsgBody(row.dataset.convkey, parseInt(msgRow.dataset.triageMsg));
     return;
   }
   // Topic header collapse/expand
@@ -90,18 +85,111 @@ function _triageMsgsHTML(convKey) {
   const msgs = state.triageMsgCache[convKey];
   if (!msgs) return '<div style="padding:8px 14px;font-size:11px;color:#5ba4cf"><div class="spinner spinner-sm" style="display:inline-block"></div> Loading…</div>';
   if (!msgs.length) return '<div style="padding:8px 14px;font-size:11px;color:#5ba4cf">No messages</div>';
-  return [...msgs].reverse().map((m,i) => {
-    const from = m.from_name||m.from_address||'?';
-    const preview = String(m.body||m.body_preview||'').replace(/\s+/g,' ').trim().slice(0,80);
-    const date = fmtDate((m.received_date_time||'').slice(0,19));
-    return `<div class="triage-msg-row" id="tmr-${esc(convKey)}-${i}" data-triage-msg="${i}">
-      <span class="triage-msg-chev">▶</span>
-      <span class="triage-msg-from">${esc(from)}</span>
-      <span class="triage-msg-prev">${esc(preview)}</span>
-      <span class="triage-msg-date">${esc(date)}</span>
+  return msgs.map((m,i) => _triageMsgCard(convKey, m, i)).join('');
+}
+
+function _triageMsgCard(convKey, m, idx) {
+  const from = m.from_name||m.from_address||'Unknown';
+  const date = fmtDate((m.received_date_time||'').slice(0,19));
+  if (!state.triageExpandedMsgs[convKey]) state.triageExpandedMsgs[convKey] = new Set();
+  const isOpen = state.triageExpandedMsgs[convKey].has(idx);
+  const toList = (m.to_recipients||[]).map(r=>esc(r.name||r.address)).join(', ');
+  const ccList = (m.cc_recipients||[]).map(r=>esc(r.name||r.address)).join(', ');
+  const recipRow = (toList||ccList)?`<div class="msg-recips">`
+    +(toList?`<span><span class="msg-recip-lbl">To:</span>${toList}</span>`:'')
+    +(ccList?`<span><span class="msg-recip-lbl">CC:</span>${ccList}</span>`:'')
+    +`</div>`:'';
+  const ck = esc(convKey);
+  const summaryVal = state.triageMsgSummaries[m.id];
+  const summaryHtml = summaryVal == null
+    ? `<span class="msg-preview msg-summary-loading" id="tms-${esc(m.id)}"><span class="spinner spinner-sm" style="display:inline-block;width:8px;height:8px;margin-right:4px"></span></span>`
+    : summaryVal
+      ? `<span class="msg-preview" id="tms-${esc(m.id)}">${esc(summaryVal)}</span>`
+      : `<span class="msg-preview" id="tms-${esc(m.id)}" style="color:#4a6080;font-style:italic">No summary</span>`;
+  return `<div class="msg-card${isOpen?' open':''}" id="tmc-${ck}-${idx}">
+    <div class="msg-hdr" data-tmc-key="${ck}" data-tmc-idx="${idx}" onclick="triageToggleMsg(this.dataset.tmcKey,+this.dataset.tmcIdx)">
+      <span class="avatar" style="background:${avColor(from)};width:24px;height:24px;font-size:8.5px;border:2px solid #0a1628;flex-shrink:0">${initials(from)}</span>
+      <span class="msg-from-wrap"><span class="msg-from">${esc(from)}</span>${summaryHtml}</span>
+      <span class="msg-date">${esc(date)}</span>
+      <a class="msg-owa-link" href="${'https://outlook.office.com/owa/?ItemID='+encodeURIComponent(m.id)+'&exvsurl=1&viewmodel=ReadMessageItem'}" target="_blank" rel="noopener" title="Open in Outlook Web" onclick="event.stopPropagation()">📎</a>
+      <span class="msg-chevron">▾</span>
     </div>
-    <div class="triage-msg-body" id="tmb-${esc(convKey)}-${i}" style="display:none">${esc(String(m.body||m.body_preview||'').trim())}</div>`;
-  }).join('');
+    ${recipRow}
+    <div class="msg-body" id="tmb-${ck}-${idx}">${isOpen?_triageMsgBody(convKey,m,idx):''}</div>
+  </div>`;
+}
+
+function _triageMsgBody(convKey, m, idx) {
+  if (!m) return '';
+  if (m.body_html) {
+    const safe = _injectBaseTarget(m.body_html).replace(/"/g, '&quot;');
+    return `<iframe sandbox="allow-same-origin allow-popups" srcdoc="${safe}"
+      style="width:100%;border:none;min-height:200px;display:block;background:#fff;border-radius:4px;"
+      onload="this.style.height=Math.min(700,this.contentDocument.body.scrollHeight+20)+'px'"></iframe>`;
+  }
+  setTimeout(() => loadTriageMsgHtml(convKey, idx), 0);
+  const plain = decodeEntities(String(m.body || m.body_preview || '')).trim();
+  return plain
+    ? `<div style="font-size:12px;color:#c9d1d9;line-height:1.8;white-space:pre-wrap">${esc(plain)}</div>`
+    : `<div style="padding:12px;color:#5ba4cf;font-size:11px"><div class="spinner spinner-sm" style="display:inline-block;margin-right:6px"></div>Loading…</div>`;
+}
+
+function triageToggleMsg(convKey, idx) {
+  const card = document.getElementById(`tmc-${convKey}-${idx}`);
+  const body = document.getElementById(`tmb-${convKey}-${idx}`);
+  if (!card || !body) return;
+  if (!state.triageExpandedMsgs[convKey]) state.triageExpandedMsgs[convKey] = new Set();
+  const expanded = state.triageExpandedMsgs[convKey];
+  const msgs = state.triageMsgCache[convKey] || [];
+  const m = msgs[idx];
+  if (expanded.has(idx)) {
+    expanded.delete(idx);
+    card.classList.remove('open');
+    body.innerHTML = '';
+  } else {
+    expanded.add(idx);
+    card.classList.add('open');
+    body.innerHTML = _triageMsgBody(convKey, m, idx);
+  }
+}
+
+async function loadTriageMsgSummary(msgId) {
+  if (state.triageMsgSummaries[msgId] !== null && state.triageMsgSummaries[msgId] !== undefined) return;
+  state.triageMsgSummaries[msgId] = null; // mark as in-flight
+  try {
+    const r = await fetch(`/api/summarize_message?id=${encodeURIComponent(msgId)}`).then(r=>r.json());
+    state.triageMsgSummaries[msgId] = r.summary || '';
+  } catch(e) {
+    state.triageMsgSummaries[msgId] = '';
+  }
+  // Update the summary span if it's still in the DOM
+  const el = document.getElementById('tms-'+msgId);
+  if (el) {
+    const s = state.triageMsgSummaries[msgId];
+    el.className = 'msg-preview';
+    el.innerHTML = '';
+    if (s) el.textContent = s;
+    else { el.style.color = '#4a6080'; el.style.fontStyle = 'italic'; el.textContent = 'No summary'; }
+  }
+}
+
+function loadTriageMsgHtml(convKey, idx) {
+  const msgs = state.triageMsgCache[convKey] || [];
+  const m = msgs[idx];
+  if (!m || m.body_html) return;
+  const es = new EventSource(`/api/format_message_stream?id=${encodeURIComponent(m.id)}`);
+  es.onmessage = (evt) => {
+    const data = JSON.parse(evt.data);
+    if (data.type === 'done') {
+      es.close();
+      if (data.body_html) {
+        m.body_html = data.body_html;
+        const bodyEl = document.getElementById(`tmb-${convKey}-${idx}`);
+        if (bodyEl && state.triageExpandedMsgs[convKey]?.has(idx)) bodyEl.innerHTML = _triageMsgBody(convKey, m, idx);
+      }
+    }
+  };
+  es.onerror = () => es.close();
 }
 
 async function triageToggleExpand(convKey) {
@@ -115,10 +203,19 @@ async function triageToggleExpand(convKey) {
     msgsEl.style.display = '';
     if (!state.triageMsgCache[convKey]) {
       msgsEl.innerHTML = '<div style="padding:8px 14px;font-size:11px;color:#5ba4cf"><div class="spinner spinner-sm" style="display:inline-block;margin-right:6px"></div>Loading…</div>';
-      const r = await fetch(`/api/thread_messages?conversationKey=${encodeURIComponent(convKey)}`).then(r=>r.json()).catch(()=>null);
+      const t = state.threadMap[convKey];
+      const ids = t && t.emailIds && t.emailIds.length ? t.emailIds : null;
+      const url = ids ? '/api/thread_messages?' + ids.map(id=>`id=${encodeURIComponent(id)}`).join('&') : `/api/thread_messages?conversationKey=${encodeURIComponent(convKey)}`;
+      const r = await fetch(url).then(r=>r.json()).catch(()=>null);
       const msgs = (r&&r.messages||[]).slice().sort((a,b)=>(b.received_date_time||'')>(a.received_date_time||'')?1:-1);
       state.triageMsgCache[convKey] = msgs;
-      msgsEl.innerHTML = _triageMsgsHTML(convKey);
+    }
+    msgsEl.innerHTML = _triageMsgsHTML(convKey);
+    // Kick off AI summary for any messages not yet summarised
+    for (const m of (state.triageMsgCache[convKey] || [])) {
+      if (m.id && state.triageMsgSummaries[m.id] === undefined) {
+        loadTriageMsgSummary(m.id);
+      }
     }
   } else {
     state.expandedTriageRows.delete(convKey);
@@ -127,22 +224,14 @@ async function triageToggleExpand(convKey) {
   }
 }
 
-function triageToggleMsgBody(convKey, idx) {
-  const row = document.getElementById(`tmr-${convKey}-${idx}`);
-  const body = document.getElementById(`tmb-${convKey}-${idx}`);
-  if (!body) return;
-  const open = body.style.display !== 'none';
-  body.style.display = open ? 'none' : '';
-  if (row) row.classList.toggle('open', !open);
-}
 
-function triageOpenReply(convKey) {
+async function triageOpenReply(convKey) {
   const thread = state.threadMap[convKey];
   if (!thread) return;
   closeTriageSheet();
-  // Navigate to thread then open reply modal
-  selectThread(convKey);
-  setTimeout(() => openReply(encodeThread(thread)), 500);
+  await selectThread(convKey);
+  _replyState.fromTriage = true;
+  openReply(encodeThread(thread));
 }
 
 function toggleTriageTopic(topic) {

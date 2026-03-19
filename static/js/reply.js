@@ -1,32 +1,43 @@
 // ── Reply (2-step) ─────────────────────────────────────────────────────────────
-let _replyState = {thread:null, to:[], cc:[]};
+let _replyState = {thread:null, to:[], cc:[], fromTriage:false};
 
 async function openReply(enc) {
   _replyState.thread = decodeThread(enc);
   _activeThread = _replyState.thread;
   const t = _replyState.thread;
 
-  // Build reply-all from ALL messages in thread: collect every sender + To across all msgs into To,
-  // every CC across all msgs into CC; deduplicate; exclude self; anyone in To is removed from CC.
   _replyState.to = [];
   _replyState.cc = [];
   const myAddr = MY_EMAIL.toLowerCase();
   const addUniq = (list, r) => {
     if (!r || !r.address) return;
-    if (r.address.toLowerCase() === myAddr) return; // exclude self
+    if (r.address.toLowerCase() === myAddr) return;
     if (!list.find(x=>x.address.toLowerCase()===r.address.toLowerCase())) list.push(r);
   };
+
+  // Add senders from all loaded messages
   for (const msg of state.currentMsgs) {
     if (msg.from_address) addUniq(_replyState.to, {name:msg.from_name||msg.from_address, address:msg.from_address});
-    for (const r of (msg.to_recipients||[])) addUniq(_replyState.to, r);
-    for (const r of (msg.cc_recipients||[])) addUniq(_replyState.cc, r);
   }
+
+  // Fetch actual TO/CC recipients from Outlook for the latest message
+  if (t.latestId) {
+    try {
+      const rd = await fetch(`/api/message_recipients?id=${encodeURIComponent(t.latestId)}`).then(r=>r.json()).catch(()=>null);
+      if (rd) {
+        for (const r of (rd.to||[])) addUniq(_replyState.to, r);
+        for (const r of (rd.cc||[])) addUniq(_replyState.cc, r);
+      }
+    } catch(e) {}
+  }
+
   // Remove anyone already in To from CC
   _replyState.cc = _replyState.cc.filter(
     r => !_replyState.to.find(t => t.address.toLowerCase() === r.address.toLowerCase())
   );
 
-  document.getElementById('reply-sub').textContent = `Re: ${t.subject||''}`;
+  const subj = t.subject || '';
+  document.getElementById('reply-sub').textContent = /^re:\s/i.test(subj) ? subj : `Re: ${subj}`;
   const bodyEl = document.getElementById('reply-body');
   bodyEl.value = '';
   bodyEl.placeholder = 'Generating reply…';
@@ -83,6 +94,7 @@ async function sendReply() {
   const t=_replyState.thread||_activeThread;
   const to=_replyState.to.map(r=>r.address).filter(Boolean);
   const cc=_replyState.cc.map(r=>r.address).filter(Boolean);
+  _replyState.fromTriage = false; // don't restore triage on send — _act handles navigation
   closeModals();
   await _act('/api/reply/'+t.latestId,{body,conversationKey:t.conversationKey,to,cc},t.conversationKey);
 }

@@ -13,6 +13,24 @@ function esc(s) {
   return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
+// Decode HTML entities in text (e.g. &nbsp; &amp; &lt;) for display as plain text
+function decodeEntities(s) {
+  if (!s || typeof s !== 'string') return s || '';
+  const ta = document.createElement('textarea');
+  ta.innerHTML = s;
+  return ta.value;
+}
+
+function _injectBaseTarget(html) {
+  const tag = '<base target="_blank">';
+  const hi = html.indexOf('<head');
+  if (hi !== -1) {
+    const close = html.indexOf('>', hi);
+    if (close !== -1) return html.slice(0, close+1) + tag + html.slice(close+1);
+  }
+  return tag + html;
+}
+
 // ── Encode/decode thread ───────────────────────────────────────────────────────
 function encodeThread(t) {
   try {
@@ -30,7 +48,7 @@ function fmtDate(s) {
   if (!s) return '';
   const d=new Date(s),now=new Date(),diff=now-d;
   if (isNaN(d)) return '';
-  if (diff<3600000){const m=Math.round(diff/60000);return m<1?'just now':`${m}m`;}
+  if (diff<3600000) return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
   if (diff<86400000) return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
   if (diff<604800000) return d.toLocaleDateString([],{weekday:'short'});
   return d.toLocaleDateString([],{month:'short',day:'numeric'});
@@ -102,23 +120,23 @@ function linkify(text) {
   }).join('');
 }
 
-// Render AI summary — handles both legacy plain text and new 3-part format
-// (parts separated by blank lines: FACTS, OPEN QUESTIONS, NEXT ACTION)
+// Render AI summary — handles ||BREAK|| delimited 3-part format and legacy plain text
 function _renderSummary(summary) {
   if (!summary) return '';
-  const parts = summary.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+  // New format: sections delimited by ||BREAK||
+  const parts = summary.split('||BREAK||').map(p => p.trim()).filter(Boolean);
   if (parts.length < 2) {
-    // Legacy single-block summary — just render as-is
+    // Legacy single-block — just render as plain text
     return `<span>${esc(summary)}</span>`;
   }
   const labels = ['📋 Facts', '❓ Open Questions / Blockers', '⚡ Your Next Action'];
   return parts.map((p, i) => {
     const label = labels[i] || '';
-    // Render bullet lines as a list if they start with •, -, or *
-    const lines = p.split('\n').map(l => l.trim()).filter(Boolean);
-    const isList = lines.length > 1 && lines.every(l => /^[•\-\*]/.test(l));
+    // Bullets: lines starting with • (inline in single string, split on •)
+    const bullets = p.split('•').map(b => b.trim()).filter(Boolean);
+    const isList = bullets.length > 1;
     const body = isList
-      ? `<ul class="sum-list">${lines.map(l => `<li>${esc(l.replace(/^[•\-\*]\s*/,''))}</li>`).join('')}</ul>`
+      ? `<ul class="sum-list">${bullets.map(b => `<li>${esc(b)}</li>`).join('')}</ul>`
       : `<span>${esc(p)}</span>`;
     return `<div class="sum-part"><span class="sum-part-lbl">${label}</span>${body}</div>`;
   }).join('');

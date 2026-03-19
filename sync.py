@@ -1,5 +1,5 @@
 """
-sync.py — Background sync thread for Clanker email triage app.
+sync.py — Background sync thread for Outlook Express email triage app.
 """
 import json
 import re
@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 from config import INBOX_FETCH, FOLDER_FETCH, SYNC_INTERVAL, SKIP_SYNC_FOLDERS
 from db import get_db, meta_get, meta_set
 from mcp_client import call_tool
-from ai import analyze_thread, format_message_ai
+from ai import analyze_thread, format_message_ai, _normalize_topic
 
 # ─── Sync status ───────────────────────────────────────────────────────────────
 
@@ -322,6 +322,11 @@ def _do_sync():
         total = len(affected_keys)
         _sync_status.update({"phase": "analyzing", "done": 0, "total": total})
 
+        # Seed from already-analyzed threads, then accumulate new ones in-memory
+        existing_topics: list[str] = [r[0] for r in db.execute(
+            "SELECT DISTINCT topic FROM threads WHERE topic != ''"
+        ).fetchall()]
+
         for idx, ck in enumerate(affected_keys):
             # Only consider inbox emails for thread analysis
             rows = db.execute(
@@ -334,9 +339,6 @@ def _do_sync():
             thread_emails = [dict(r) for r in rows]
             display_subj = _clean(thread_emails[-1].get("subject", ck), 55)
             _sync_status["progress"] = f"Analyzing {idx+1}/{total}: \"{display_subj}\""
-            existing_topics = [r[0] for r in db.execute(
-                "SELECT DISTINCT topic FROM threads WHERE topic != ''"
-            ).fetchall()]
 
             try:
                 result = analyze_thread(thread_emails, efforts, other, existing_topics=existing_topics)
@@ -379,8 +381,11 @@ def _do_sync():
             )
             db.commit()
             threads_updated += 1
+            new_topic = _normalize_topic(result.get("topic", ""))
+            if new_topic and new_topic not in existing_topics:
+                existing_topics.append(new_topic)
             _sync_status["done"] = idx + 1
-            print(f"  ✓ {display_subj!r} → {result.get('action')} [{result.get('urgency')}]")
+            print(f"  ✓ {display_subj!r} → {result.get('action')} [{result.get('urgency')}] [{new_topic}]")
 
     # Recompute has_unread for all threads based on current is_read state in emails table.
     # This keeps threads in sync even when emails are read in native Outlook/mobile.

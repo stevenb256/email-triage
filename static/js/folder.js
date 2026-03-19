@@ -95,7 +95,7 @@ async function _mboxToggleRead(convKey) {
 async function mboxQuickReply(convKey, folder) {
   await openMailboxThread(convKey, folder);
   const thread = state.threadMap[convKey];
-  if (thread) setTimeout(() => openReply(encodeThread(thread)), 300);
+  if (thread) openReply(encodeThread(thread));
 }
 
 async function mboxQuickDelete(convKey) {

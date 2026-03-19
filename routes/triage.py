@@ -1,5 +1,5 @@
 """
-routes/triage.py — Triage-related API routes for Clanker.
+routes/triage.py — Triage-related API routes for Outlook Express.
 """
 import json
 import threading
@@ -295,10 +295,9 @@ def api_reanalyze_all():
             display_subj = _clean(thread_emails[-1].get("subject", ck), 55)
             _sync_status["progress"] = f"Re-analyzing {idx+1}/{total}: \"{display_subj}\""
             try:
-                existing_topics = [r[0] for r in db.execute(
-                    "SELECT DISTINCT topic FROM threads WHERE topic != '' AND conversation_key != ?",(ck,)
-                ).fetchall()]
-                result = analyze_thread(thread_emails, efforts, other, existing_topics=existing_topics)
+                # No existing_topics — each thread picks a fresh specific label independently.
+                # Similar threads will naturally land on the same project name.
+                result = analyze_thread(thread_emails, efforts, other)
                 db.execute(
                     "UPDATE threads SET topic=?,action=?,urgency=?,summary=?,"
                     "suggested_reply=?,suggested_folder=?,updated_at=? WHERE conversation_key=?",
@@ -309,6 +308,7 @@ def api_reanalyze_all():
                 )
                 db.commit()
                 updated += 1
+                print(f"  topic: {result.get('topic','?')!r} — {display_subj[:45]}")
             except Exception as ex:
                 print(f"  Re-analyze error for {ck}: {ex}")
             _sync_status["done"] = idx + 1

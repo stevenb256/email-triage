@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Clanker</title>
+<title>Outlook Express</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📧</text></svg>">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/base.css') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/layout.css') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/triage.css') }}">
@@ -15,7 +16,7 @@
 <div class="app">
   <header class="header">
     <div class="header-brand">
-      <h1>Clanker</h1>
+      <h1>Outlook Express</h1>
     </div>
     <div class="header-center">
       <div class="search-wrap">
@@ -37,12 +38,17 @@
     <nav class="sidebar" id="sidebar">
       <div class="sidebar-scroll">
         <div id="sidebar-nav">
-          <button class="triage-sidebar-btn" id="triage-sidebar-btn" onclick="openTriageSheet()">📋 Triage Sheet</button>
-          <div class="sidebar-hdr">Folders</div>
           <div id="folder-tree"></div>
-          <button class="triage-sidebar-btn" id="nav-calendar" onclick="switchTab('calendar')" style="margin-top:8px">📅 Calendar</button>
+          <div class="top-contacts" id="top-contacts">
+            <div class="top-contacts-hdr">Top Collaborators</div>
+            <div id="top-contacts-list"><div class="top-contacts-loading">Loading…</div></div>
+          </div>
           <div class="today-cal" id="today-cal">
-            <div class="today-cal-hdr">Today</div>
+            <div class="today-cal-hdr">
+              <button class="today-cal-nav" onclick="todayCalMove(-1)">‹</button>
+              <span id="today-cal-date">Today</span>
+              <button class="today-cal-nav" onclick="todayCalMove(1)">›</button>
+            </div>
             <div class="week-hours-line" id="week-hours-line"></div>
             <div id="today-cal-list"><div class="today-cal-empty">Loading…</div></div>
           </div>
@@ -63,13 +69,19 @@
     <div class="resize-handle" id="resize-handle"></div>
     <div class="right-pane" id="right-pane">
       <div id="first-load">
-        <div class="splash-ascii"> ██████╗██╗      █████╗ ███╗   ██╗██╗  ██╗███████╗██████╗
-██╔════╝██║     ██╔══██╗████╗  ██║██║ ██╔╝██╔════╝██╔══██╗
-██║     ██║     ███████║██╔██╗ ██║█████╔╝ █████╗  ██████╔╝
-██║     ██║     ██╔══██║██║╚██╗██║██╔═██╗ ██╔══╝  ██╔══██╗
-╚██████╗███████╗██║  ██║██║ ╚████║██║  ██╗███████╗██║  ██║
- ╚═════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝</div>
-        <div class="splash-sub">AI First Collab</div>
+        <div class="splash-ascii"> ██████╗ ██╗   ██╗████████╗██╗      ██████╗  ██████╗ ██╗  ██╗
+██╔═══██╗██║   ██║╚══██╔══╝██║     ██╔═══██╗██╔═══██╗██║ ██╔╝
+██║   ██║██║   ██║   ██║   ██║     ██║   ██║██║   ██║█████╔╝
+██║   ██║██║   ██║   ██║   ██║     ██║   ██║██║   ██║██╔═██╗
+╚██████╔╝╚██████╔╝   ██║   ███████╗╚██████╔╝╚██████╔╝██║  ██╗
+ ╚═════╝  ╚═════╝    ╚═╝   ╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝
+███████╗██╗  ██╗██████╗ ██████╗ ███████╗███████╗███████╗
+██╔════╝╚██╗██╔╝██╔══██╗██╔══██╗██╔════╝██╔════╝██╔════╝
+█████╗   ╚███╔╝ ██████╔╝██████╔╝█████╗  ███████╗███████╗
+██╔══╝   ██╔██╗ ██╔═══╝ ██╔══██╗██╔══╝  ╚════██║╚════██║
+███████╗██╔╝ ██╗██║     ██║  ██║███████╗███████║███████║
+╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝</div>
+        <div class="splash-sub">AI-First Email</div>
         <div class="splash-tagline">Powered by Claude · Outlook · MCP</div>
         <div class="splash-loader">
           <div class="spinner spinner-sm" style="border-top-color:#38bdf8;border-color:#1a3252;border-top-color:#38bdf8"></div>

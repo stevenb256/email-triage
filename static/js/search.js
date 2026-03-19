@@ -21,7 +21,7 @@ async function doSearch(q) {
       <div class="search-row-body">
         <div class="search-row-subj">${esc(e.subject||'(No subject)')}</div>
         <div class="search-row-meta">${esc(e.from_name||e.from_address||'')} · ${esc(fmtDate((e.received_date_time||'').slice(0,19)))}</div>
-        <div class="search-row-preview">${esc(e.body_preview||'')}</div>
+        <div class="search-row-preview">${esc(decodeEntities(e.body_preview||''))}</div>
       </div>
       <div class="search-row-folder">${esc(e.folder||'Unknown')}</div>
     </div>`).join('');

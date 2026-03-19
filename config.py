@@ -1,5 +1,5 @@
 """
-config.py — Constants for Clanker email triage app.
+config.py — Constants for Outlook Express email triage app.
 """
 import os
 
