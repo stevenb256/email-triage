@@ -445,6 +445,16 @@ def _do_sync():
             print(f"  Warning: could not sync folder '{folder_name}': {ex}")
         _sync_status["done"] = fi + 1
 
+    # ── Phase 3: Generate embeddings for semantic search ─────────────────────
+    try:
+        _sync_status["progress"] = "Generating embeddings…"
+        from embeddings import embed_missing
+        embedded = embed_missing()
+        if embedded:
+            print(f"  Embeddings: generated for {embedded} email(s)")
+    except Exception as ex:
+        print(f"  Warning: embedding generation failed: {ex}")
+
     _sync_status.update({"phase": "done", "progress": f"Done — {threads_updated} thread(s) updated."})
     return len(new_inbox), threads_updated
 
@@ -472,5 +482,13 @@ def _sync_loop():
     from mcp_client import _session_ready
     _session_ready.wait(timeout=30)
     while True:
+        # Auto-refresh token before sync if needed
+        try:
+            from token_refresh import needs_refresh, refresh_token
+            if needs_refresh():
+                print("  [sync] Token expiring soon, auto-refreshing…")
+                refresh_token()
+        except Exception as ex:
+            print(f"  [sync] Token refresh check failed: {ex}")
         run_sync()
         time.sleep(SYNC_INTERVAL)

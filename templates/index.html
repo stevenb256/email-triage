@@ -60,6 +60,7 @@
           <div class="sync-dot" id="sync-dot"></div>
           <span class="sidebar-sync-txt" id="sync-txt">Connecting…</span>
           <span id="new-badge-wrap"></span>
+          <button class="btn btn-ghost btn-xs" id="refresh-token-btn" onclick="refreshToken()" title="Refresh Outlook token" style="margin-left:auto;font-size:9px;opacity:.6">🔑</button>
         </div>
         <div class="sidebar-sync-bar-wrap" id="sync-bar-wrap">
           <div class="sidebar-sync-bar" id="sync-bar" style="width:0%"></div>
@@ -141,7 +142,7 @@
 <!-- Reply modal -->
 <div class="modal-overlay" id="reply-modal">
   <div class="modal modal-lg">
-    <h3>↩ Reply All</h3>
+    <h3 id="reply-modal-title">↩ Reply All</h3>
     <div class="modal-sub" id="reply-sub"></div>
     <div class="recip-row">
       <span class="recip-label">TO</span>
@@ -166,7 +167,7 @@
 <!-- Compose modal -->
 <div class="modal-overlay" id="compose-modal">
   <div class="modal modal-xl">
-    <h3>✉ New Message</h3>
+    <h3 id="compose-modal-title">✉ New Message</h3>
     <div class="recip-row" style="position:relative;">
       <span class="recip-label">TO</span>
       <div style="flex:1;position:relative;">
@@ -192,7 +193,7 @@
     <textarea id="compose-body" style="margin-top:10px;min-height:340px;resize:vertical;width:100%;box-sizing:border-box;" placeholder="Write your message…"></textarea>
     <div class="modal-footer">
       <button class="btn btn-ghost" onclick="closeModals()">Cancel</button>
-      <button class="btn btn-reply" onclick="sendNewMessage()">✉ Send</button>
+      <button class="btn btn-reply" id="compose-send-btn" onclick="sendNewMessage()">✉ Send</button>
     </div>
   </div>
 </div>
@@ -219,6 +220,32 @@
     <div class="modal-footer">
       <button class="btn btn-ghost" onclick="closeModals()">Cancel</button>
       <button class="btn btn-delete" onclick="confirmDelete()">Delete</button>
+    </div>
+  </div>
+</div>
+
+<!-- View message modal (triage full HTML view) -->
+<div class="modal-overlay" id="view-msg-overlay">
+  <div class="modal modal-xl">
+    <h3 id="view-msg-subject"></h3>
+    <div class="view-msg-recips">
+      <div class="recip-row"><span class="recip-label">TO</span> <span id="view-msg-to"></span></div>
+      <div class="recip-row" id="view-msg-cc-row"><span class="recip-label">CC</span> <span id="view-msg-cc"></span></div>
+    </div>
+    <div id="view-msg-body" style="margin-top:10px;max-height:65vh;overflow-y:auto;"></div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModals()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- JSON debug modal -->
+<div class="modal-overlay" id="json-debug-overlay">
+  <div class="modal modal-xl">
+    <h3>{ } Message JSON</h3>
+    <pre id="json-debug-content" style="max-height:65vh;overflow:auto;background:#0a1628;border:1px solid #243f65;border-radius:6px;padding:12px;font-size:11px;color:#8b949e;line-height:1.6;white-space:pre-wrap;word-break:break-all;"></pre>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModals()">Close</button>
     </div>
   </div>
 </div>

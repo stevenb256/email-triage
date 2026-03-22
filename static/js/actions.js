@@ -6,9 +6,13 @@ function openFile(enc) {
   const populate=(folders,effortsFolders)=>{
     const es=new Set(effortsFolders||[]);
     const eff=folders.filter(n=>es.has(n)),oth=folders.filter(n=>!es.has(n));
+    // Ensure system folders are always available
+    const sys = ['Deleted Items','Archive','Inbox'];
+    const sysFiltered = sys.filter(n=>!eff.includes(n)&&!oth.includes(n));
     let h='';
     if (eff.length) h+=`<optgroup label="Efforts">`+eff.map(n=>`<option value="${esc(n)}"${n===suggested?' selected':''}>${esc(n)}</option>`).join('')+`</optgroup>`;
     if (oth.length) h+=`<optgroup label="Other">`+oth.map(n=>`<option value="${esc(n)}"${n===suggested?' selected':''}>${esc(n)}</option>`).join('')+`</optgroup>`;
+    if (sysFiltered.length) h+=`<optgroup label="System">`+sysFiltered.map(n=>`<option value="${esc(n)}"${n===suggested?' selected':''}>${esc(n)}</option>`).join('')+`</optgroup>`;
     document.getElementById('folder-select').innerHTML=h;
   };
   if (state.folders.length){populate(state.folders,state.effortsFolders);document.getElementById('file-modal').classList.add('open');}
@@ -21,20 +25,33 @@ async function openDelete(enc) {
 }
 
 function closeModals() {
-  const wasReplyFromTriage = _replyState && _replyState.fromTriage;
   document.querySelectorAll('.modal-overlay').forEach(m=>m.classList.remove('open'));
   _activeThread=null;
-  if (_replyState) _replyState.fromTriage = false;
   // Close any open people dropdowns
   document.querySelectorAll('.people-dropdown').forEach(d=>d.classList.remove('open'));
-  // Restore triage view if reply was opened from triage
-  if (wasReplyFromTriage) openTriageSheet();
+  // Reset compose modal if it was used for forward
+  if (window._forwardState) {
+    window._forwardState = null;
+    const sendBtn = document.getElementById('compose-send-btn');
+    if (sendBtn) { sendBtn.onclick = sendNewMessage; sendBtn.textContent = '✉ Send'; }
+    document.getElementById('compose-modal-title').textContent = '✉ New Message';
+    document.getElementById('compose-body').style.minHeight = '';
+  }
+  // Single flag: restore triage if any modal was opened from triage context
+  if (state.returnToTriage) {
+    state.returnToTriage = false;
+    openTriageSheet();
+  }
 }
 
 async function fileThread() {
   const folder=document.getElementById('folder-select').value;
-  const t=_activeThread; closeModals();
+  const t=_activeThread;
+  const returnToTriage = state.returnToTriage;
+  closeModals();  // clears state.returnToTriage and restores triage
   await _act('/api/move',{ids:t.emailIds,folder,conversationKey:t.conversationKey},t.conversationKey);
+  // If filed from triage, re-render triage (thread was removed by _act)
+  if (returnToTriage) openTriageSheet();
 }
 
 async function quickFile(enc,folder) {
@@ -83,7 +100,7 @@ function _hideActSpinner() {
 }
 
 async function _act(url,body,convKey) {
-  const label = url.includes('delete') ? 'Deleting…' : url.includes('move') ? 'Filing…' : 'Sending…';
+  const label = url.includes('delete') ? 'Deleting…' : url.includes('move') ? 'Filing…' : url.includes('forward') ? 'Forwarding…' : 'Sending…';
   _showActSpinner(label);
   const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const d=await res.json().catch(()=>({}));

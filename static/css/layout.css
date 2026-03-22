@@ -96,5 +96,6 @@
 .search-row-meta{font-size:10.5px;color:#8b949e;margin-top:2px;}
 .search-row-preview{font-size:11px;color:#5ba4cf;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .search-row-folder{font-size:10px;color:#5ba4cf;background:#1a3252;border-radius:4px;padding:1px 6px;flex-shrink:0;margin-top:2px;white-space:nowrap;}
+.search-score{font-size:9px;font-weight:400;color:#3fb950;background:rgba(63,185,80,.1);border-radius:4px;padding:1px 5px;margin-left:6px;}
 
 /* Resizable sidebar IIFE styles applied dynamically via JS */

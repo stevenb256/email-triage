@@ -29,10 +29,12 @@ function _triagePaneClick(e) {
     if (!row) return;
     const convKey = row.dataset.convkey;
     const action  = btn.dataset.triageAction;
-    if      (action==='reply')  triageOpenReply(convKey);
-    else if (action==='file')   triageMark(convKey,'file');
-    else if (action==='delete') triageMark(convKey,'delete');
-    else if (action==='clear')  triageMark(convKey,null);
+    if      (action==='reply')        triageOpenReply(convKey, 'all');
+    else if (action==='reply-sender') triageOpenReply(convKey, 'sender');
+    else if (action==='forward')      triageOpenForward(convKey);
+    else if (action==='file')         triageFileNow(convKey);
+    else if (action==='delete')       triageDeleteNow(convKey);
+    else if (action==='view')         triageViewMessage(convKey);
     return;
   }
   // Row expand/collapse (summary area)
@@ -51,34 +53,93 @@ function _triagePaneClick(e) {
 
 function _triageRowHTML(t) {
   const convKey = t.conversationKey;
-  const action = state.triageActions[convKey];
-  const actionCls = action ? ' ts-'+action.type : '';
   const expanded = state.expandedTriageRows.has(convKey);
   const urgCls = {high:'urg-high',medium:'urg-medium',low:'urg-low'}[t.urgency]||'urg-low';
   const rec = ACTION_REC[t.action] || ACTION_REC.read;
   const folder = t.suggestedFolder || '';
   const fileLbl = folder ? `📁 ${folder}` : '📁 File';
-  const statusLbl = action ? (action.type==='delete'?'🗑 Queued':action.type==='file'?`📁 → ${folder||'?'}`:'') : '';
   const msgsHtml = expanded ? _triageMsgsHTML(convKey) : '';
-  return `<div class="triage-row${actionCls}${expanded?' expanded':''}" id="triage-row-${esc(convKey)}" data-convkey="${esc(convKey)}">
+  // Recipients row (populated async)
+  const recipId = `triage-recips-${esc(convKey)}`;
+  return `<div class="triage-row${expanded?' expanded':''}" id="triage-row-${esc(convKey)}" data-convkey="${esc(convKey)}">
     <div class="triage-row-summary" data-triage-expand="1">
       <div class="triage-row-top">
         <span class="triage-row-expand-chevron">▶</span>
         <span class="urg-pill ${urgCls}">${(t.urgency||'low').toUpperCase()}</span>
         <span class="triage-subj">${esc(t.subject||'(No subject)')}</span>
         <span class="action-rec ${rec.cls}">${rec.icon} ${rec.label}</span>
+        <button class="btn btn-ghost btn-xs triage-view-btn" data-triage-action="view" title="View full message">👁 View</button>
       </div>
+      <div class="triage-row-recips" id="${recipId}"></div>
       ${t.summary?`<div class="triage-sum" style="padding-left:17px">${_renderSummary(t.summary)}</div>`:''}
     </div>
     <div class="triage-msgs" id="triage-msgs-${esc(convKey)}" style="${expanded?'':'display:none'}">${msgsHtml}</div>
     <div class="triage-btns">
-      <button class="btn btn-reply btn-sm" data-triage-action="reply">↩ Reply</button>
-      <button class="btn btn-ghost btn-sm btn-ts-file${action&&action.type==='file'?' active':''}" data-triage-action="file">${esc(fileLbl)}</button>
-      <button class="btn btn-ghost btn-sm btn-ts-del${action&&action.type==='delete'?' active':''}" data-triage-action="delete">🗑 Delete</button>
-      ${action?`<button class="btn btn-ghost btn-sm" data-triage-action="clear">✕</button>`:''}
-      <span class="triage-qlbl">${esc(statusLbl)}</span>
+      <button class="btn btn-reply btn-sm" data-triage-action="reply">↩ Reply All</button>
+      <button class="btn btn-ghost btn-sm" data-triage-action="reply-sender">↩ Reply</button>
+      <button class="btn btn-ghost btn-sm" data-triage-action="forward">⤳ Fwd</button>
+      <button class="btn btn-ghost btn-sm btn-ts-file" data-triage-action="file">${esc(fileLbl)}</button>
+      <button class="btn btn-ghost btn-sm btn-ts-del" data-triage-action="delete">🗑 Delete</button>
     </div>
   </div>`;
+}
+
+function _loadTriageRecips(convKey) {
+  const t = state.threadMap[convKey];
+  if (!t || !t.latestId) return;
+  const el = document.getElementById('triage-recips-'+convKey);
+  if (!el || el.dataset.loaded) return;
+  el.dataset.loaded = '1';
+  fetch(`/api/message_recipients?id=${encodeURIComponent(t.latestId)}`).then(r=>r.json()).then(rd=>{
+    if (!rd.to?.length && !rd.cc?.length) return;
+    let h = '';
+    if (rd.to?.length) h += `<span class="msg-recip-lbl">To:</span> <span class="triage-recip-list">${rd.to.map(r=>esc(r.name||r.address)).join(', ')}</span>`;
+    if (rd.cc?.length) h += `${rd.to?.length?' &nbsp; ':''}<span class="msg-recip-lbl">CC:</span> <span class="triage-recip-list">${rd.cc.map(r=>esc(r.name||r.address)).join(', ')}</span>`;
+    el.innerHTML = h;
+  }).catch(()=>{});
+}
+
+function triageViewMessage(convKey) {
+  const t = state.threadMap[convKey];
+  if (!t || !t.latestId) return;
+  const overlay = document.getElementById('view-msg-overlay');
+  if (!overlay) return;
+  // Set header info
+  document.getElementById('view-msg-subject').textContent = t.subject || '(No subject)';
+  document.getElementById('view-msg-to').textContent = 'Loading…';
+  document.getElementById('view-msg-cc').textContent = '';
+  document.getElementById('view-msg-body').innerHTML = '<div style="padding:20px;color:#5ba4cf"><div class="spinner spinner-sm" style="display:inline-block;margin-right:8px"></div>Loading message…</div>';
+  overlay.classList.add('open');
+  // Fetch recipients
+  fetch(`/api/message_recipients?id=${encodeURIComponent(t.latestId)}`).then(r=>r.json()).then(rd=>{
+    document.getElementById('view-msg-to').textContent = (rd.to||[]).map(r=>r.name||r.address).join(', ') || '(none)';
+    const ccEl = document.getElementById('view-msg-cc');
+    const ccTxt = (rd.cc||[]).map(r=>r.name||r.address).join(', ');
+    ccEl.textContent = ccTxt;
+    ccEl.parentElement.style.display = ccTxt ? '' : 'none';
+  }).catch(()=>{});
+  // Fetch full HTML body
+  fetch(`/api/format_message_stream?id=${encodeURIComponent(t.latestId)}`).then(r=>r.text()).then(txt=>{
+    let bodyHtml = '';
+    for (const line of txt.split('\n')) {
+      if (!line.startsWith('data: ')) continue;
+      try {
+        const data = JSON.parse(line.slice(6));
+        if (data.type === 'done' && data.body_html) bodyHtml = data.body_html;
+      } catch(e) {}
+    }
+    const container = document.getElementById('view-msg-body');
+    if (bodyHtml) {
+      const safe = _injectBaseTarget(bodyHtml).replace(/"/g, '&quot;');
+      container.innerHTML = `<iframe sandbox="allow-same-origin allow-popups" srcdoc="${safe}"
+        style="width:100%;border:none;min-height:400px;display:block;background:#fff;border-radius:4px;"
+        onload="this.style.height=Math.min(800,this.contentDocument.body.scrollHeight+20)+'px'"></iframe>`;
+    } else {
+      container.innerHTML = '<div style="padding:20px;color:#8b949e">No HTML body available</div>';
+    }
+  }).catch(()=>{
+    document.getElementById('view-msg-body').innerHTML = '<div style="padding:20px;color:#f85149">Failed to load message</div>';
+  });
 }
 
 function _triageMsgsHTML(convKey) {
@@ -90,7 +151,8 @@ function _triageMsgsHTML(convKey) {
 
 function _triageMsgCard(convKey, m, idx) {
   const from = m.from_name||m.from_address||'Unknown';
-  const date = fmtDate((m.received_date_time||'').slice(0,19));
+  const date = fmtDate(m.received_date_time||'');
+  const isSent = m.folder&&(m.folder.toLowerCase()==='sent items'||m.folder.toLowerCase()==='sent');
   if (!state.triageExpandedMsgs[convKey]) state.triageExpandedMsgs[convKey] = new Set();
   const isOpen = state.triageExpandedMsgs[convKey].has(idx);
   const toList = (m.to_recipients||[]).map(r=>esc(r.name||r.address)).join(', ');
@@ -100,18 +162,20 @@ function _triageMsgCard(convKey, m, idx) {
     +(ccList?`<span><span class="msg-recip-lbl">CC:</span>${ccList}</span>`:'')
     +`</div>`:'';
   const ck = esc(convKey);
+  const sentBadge = isSent?'<span class="msg-sent-badge">Sent</span>':'';
   const summaryVal = state.triageMsgSummaries[m.id];
   const summaryHtml = summaryVal == null
     ? `<span class="msg-preview msg-summary-loading" id="tms-${esc(m.id)}"><span class="spinner spinner-sm" style="display:inline-block;width:8px;height:8px;margin-right:4px"></span></span>`
     : summaryVal
       ? `<span class="msg-preview" id="tms-${esc(m.id)}">${esc(summaryVal)}</span>`
       : `<span class="msg-preview" id="tms-${esc(m.id)}" style="color:#4a6080;font-style:italic">No summary</span>`;
-  return `<div class="msg-card${isOpen?' open':''}" id="tmc-${ck}-${idx}">
+  return `<div class="msg-card${isOpen?' open':''}${isSent?' msg-sent':''}" id="tmc-${ck}-${idx}">
     <div class="msg-hdr" data-tmc-key="${ck}" data-tmc-idx="${idx}" onclick="triageToggleMsg(this.dataset.tmcKey,+this.dataset.tmcIdx)">
-      <span class="avatar" style="background:${avColor(from)};width:24px;height:24px;font-size:8.5px;border:2px solid #0a1628;flex-shrink:0">${initials(from)}</span>
-      <span class="msg-from-wrap"><span class="msg-from">${esc(from)}</span>${summaryHtml}</span>
+      ${avatarHTML(from, m.from_address||'', 24, '')}
+      <span class="msg-from-wrap"><span class="msg-from">${esc(from)}${sentBadge}</span>${summaryHtml}</span>
       <span class="msg-date">${esc(date)}</span>
       <a class="msg-owa-link" href="${'https://outlook.office.com/owa/?ItemID='+encodeURIComponent(m.id)+'&exvsurl=1&viewmodel=ReadMessageItem'}" target="_blank" rel="noopener" title="Open in Outlook Web" onclick="event.stopPropagation()">📎</a>
+      <a class="msg-json-link" href="#" title="View raw JSON" onclick="event.stopPropagation();event.preventDefault();showTriageMsgJson('${ck}',${idx})">{ }</a>
       <span class="msg-chevron">▾</span>
     </div>
     ${recipRow}
@@ -121,17 +185,41 @@ function _triageMsgCard(convKey, m, idx) {
 
 function _triageMsgBody(convKey, m, idx) {
   if (!m) return '';
-  if (m.body_html) {
-    const safe = _injectBaseTarget(m.body_html).replace(/"/g, '&quot;');
-    return `<iframe sandbox="allow-same-origin allow-popups" srcdoc="${safe}"
-      style="width:100%;border:none;min-height:200px;display:block;background:#fff;border-radius:4px;"
-      onload="this.style.height=Math.min(700,this.contentDocument.body.scrollHeight+20)+'px'"></iframe>`;
+  if (!state.showOriginal) state.showOriginal = {};
+  const showOrig = state.showOriginal[m.id];
+  const domId = `trewrite-${convKey}-${idx}`;
+  const toggleBtn = `<div class="msg-body-toggle"><button class="btn btn-ghost btn-xs" onclick="event.stopPropagation();triageToggleBodyView('${convKey}',${idx})">${showOrig ? '🤖 Smart View' : '📄 Original'}</button></div>`;
+
+  if (showOrig) {
+    // Original HTML view
+    if (m.body_html) {
+      const safe = _injectBaseTarget(m.body_html).replace(/"/g, '&quot;');
+      return toggleBtn + `<iframe sandbox="allow-same-origin allow-popups" srcdoc="${safe}"
+        style="width:100%;border:none;min-height:200px;display:block;background:#fff;border-radius:4px;"
+        onload="this.style.height=Math.min(700,this.contentDocument.body.scrollHeight+20)+'px'"></iframe>`;
+    }
+    setTimeout(() => loadTriageMsgHtml(convKey, idx), 0);
+    const plain = decodeEntities(String(m.body || m.body_preview || '')).trim();
+    return toggleBtn + (plain
+      ? `<div style="font-size:12px;color:#c9d1d9;line-height:1.8;white-space:pre-wrap">${esc(plain)}</div>`
+      : `<div style="padding:12px;color:#5ba4cf;font-size:11px"><div class="spinner spinner-sm" style="display:inline-block;margin-right:6px"></div>Loading…</div>`);
   }
-  setTimeout(() => loadTriageMsgHtml(convKey, idx), 0);
-  const plain = decodeEntities(String(m.body || m.body_preview || '')).trim();
-  return plain
-    ? `<div style="font-size:12px;color:#c9d1d9;line-height:1.8;white-space:pre-wrap">${esc(plain)}</div>`
-    : `<div style="padding:12px;color:#5ba4cf;font-size:11px"><div class="spinner spinner-sm" style="display:inline-block;margin-right:6px"></div>Loading…</div>`;
+  // Smart rewrite view (default)
+  return toggleBtn + _rewriteBodyContent(m.id, domId);
+}
+
+function triageToggleBodyView(convKey, idx) {
+  const msgs = state.triageMsgCache[convKey] || [];
+  const m = msgs[idx];
+  if (!m) return;
+  if (!state.showOriginal) state.showOriginal = {};
+  state.showOriginal[m.id] = !state.showOriginal[m.id];
+  const bodyEl = document.getElementById(`tmb-${convKey}-${idx}`);
+  if (bodyEl && state.triageExpandedMsgs[convKey]?.has(idx)) {
+    bodyEl.innerHTML = _triageMsgBody(convKey, m, idx);
+    // If switching to original and no HTML yet, fetch it
+    if (state.showOriginal[m.id] && !m.body_html) loadTriageMsgHtml(convKey, idx);
+  }
 }
 
 function triageToggleMsg(convKey, idx) {
@@ -204,13 +292,16 @@ async function triageToggleExpand(convKey) {
     if (!state.triageMsgCache[convKey]) {
       msgsEl.innerHTML = '<div style="padding:8px 14px;font-size:11px;color:#5ba4cf"><div class="spinner spinner-sm" style="display:inline-block;margin-right:6px"></div>Loading…</div>';
       const t = state.threadMap[convKey];
-      const ids = t && t.emailIds && t.emailIds.length ? t.emailIds : null;
-      const url = ids ? '/api/thread_messages?' + ids.map(id=>`id=${encodeURIComponent(id)}`).join('&') : `/api/thread_messages?conversationKey=${encodeURIComponent(convKey)}`;
+      const ids = t && t.emailIds && t.emailIds.length ? t.emailIds : [];
+      const url = '/api/thread_messages?' + ids.map(id=>`id=${encodeURIComponent(id)}`).join('&') + '&conversationKey=' + encodeURIComponent(convKey);
       const r = await fetch(url).then(r=>r.json()).catch(()=>null);
       const msgs = (r&&r.messages||[]).slice().sort((a,b)=>(b.received_date_time||'')>(a.received_date_time||'')?1:-1);
       state.triageMsgCache[convKey] = msgs;
     }
     msgsEl.innerHTML = _triageMsgsHTML(convKey);
+    // Load profile images for senders
+    const senderEmails = [...new Set((state.triageMsgCache[convKey]||[]).map(m=>m.from_address).filter(Boolean))];
+    if (senderEmails.length) loadProfileImages(senderEmails);
     // Kick off AI summary for any messages not yet summarised
     for (const m of (state.triageMsgCache[convKey] || [])) {
       if (m.id && state.triageMsgSummaries[m.id] === undefined) {
@@ -225,13 +316,22 @@ async function triageToggleExpand(convKey) {
 }
 
 
-async function triageOpenReply(convKey) {
+async function triageOpenReply(convKey, mode) {
   const thread = state.threadMap[convKey];
   if (!thread) return;
-  closeTriageSheet();
-  await selectThread(convKey);
-  _replyState.fromTriage = true;
-  openReply(encodeThread(thread));
+  state.returnToTriage = true;
+  document.removeEventListener('keydown', _triageKeydown);
+  await selectThread(convKey);  // hides all panes, shows thread-detail
+  openReply(encodeThread(thread), mode || 'all');
+}
+
+async function triageOpenForward(convKey) {
+  const thread = state.threadMap[convKey];
+  if (!thread) return;
+  state.returnToTriage = true;
+  document.removeEventListener('keydown', _triageKeydown);
+  await selectThread(convKey);  // hides all panes, shows thread-detail
+  openForward(encodeThread(thread));
 }
 
 function toggleTriageTopic(topic) {
@@ -249,7 +349,6 @@ function toggleTriageTopic(topic) {
 
 function renderTriageSheet() {
   const pane = document.getElementById('triage-pane');
-  const queuedCount = Object.keys(state.triageActions).length;
   // Sort threads within each group newest-first, then sort groups by their latest thread
   const sortedGroups = state.groups.map(g => ({
     ...g,
@@ -274,21 +373,21 @@ function renderTriageSheet() {
       </div>
     </div>`;
   }).join('');
-  pane.innerHTML = `<div class="triage-hdr">
-    <span class="triage-title">📋 Triage Sheet</span>
-    <span class="triage-queue-count" id="triage-queue-count">${queuedCount} queued</span>
-    <button class="btn btn-reply btn-sm" id="triage-execute-btn" onclick="executeAllActions()"${queuedCount===0?' disabled':''}>⚡ Execute All</button>
-  </div>
-  <div class="triage-rows">${groupsHtml}</div>
+  pane.innerHTML = `<div class="triage-rows">${groupsHtml}</div>
   <div class="mbox-kb-hint">
     <span><kbd>j</kbd><kbd>k</kbd> navigate</span>
     <span><kbd>Enter</kbd> expand</span>
     <span><kbd>r</kbd> reply</span>
     <span><kbd>d</kbd> delete</span>
     <span><kbd>f</kbd> file</span>
-    <span><kbd>x</kbd> clear</span>
     <span><kbd>Esc</kbd> back</span>
   </div>`;
+  // Load recipients for all visible triage rows
+  for (const g of sortedGroups) {
+    if (!state.collapsedTriageTopics.has(g.topic || 'Uncategorized')) {
+      for (const t of g.threads) _loadTriageRecips(t.conversationKey);
+    }
+  }
 }
 
 // ── Triage keyboard navigation ──────────────────────────────────────────────
@@ -361,15 +460,11 @@ function _triageKeydown(e) {
     return;
   } else if (e.key==='d'||e.key==='D') {
     const item = nav[idx];
-    if (item&&item.type==='thread') { e.preventDefault(); triageMark(item.convKey, state.triageActions[item.convKey]?.type==='delete'?null:'delete'); }
+    if (item&&item.type==='thread') { e.preventDefault(); triageDeleteNow(item.convKey); }
     return;
   } else if (e.key==='f'||e.key==='F') {
     const item = nav[idx];
-    if (item&&item.type==='thread') { e.preventDefault(); triageMark(item.convKey, state.triageActions[item.convKey]?.type==='file'?null:'file'); }
-    return;
-  } else if (e.key==='x'||e.key==='X') {
-    const item = nav[idx];
-    if (item&&item.type==='thread') { e.preventDefault(); triageMark(item.convKey, null); }
+    if (item&&item.type==='thread') { e.preventDefault(); triageFileNow(item.convKey); }
     return;
   } else if (e.key==='Escape') {
     e.preventDefault(); closeTriageSheet(); return;
@@ -386,89 +481,31 @@ function closeTriageSheet() {
   switchTab('mailbox');
 }
 
-function triageMark(convKey, type) {
-  if (type === null) delete state.triageActions[convKey];
-  else state.triageActions[convKey] = {type};
-  // Update row visual
-  const row = document.getElementById('triage-row-'+convKey);
-  if (row) {
-    const expanded = state.expandedTriageRows.has(convKey);
-    row.className = 'triage-row' + (type?' ts-'+type:'') + (expanded?' expanded':'');
-    const qlbl = row.querySelector('.triage-qlbl');
-    if (qlbl) qlbl.textContent = type==='delete'?'🗑 Queued':type==='file'?'📁 Queued':'';
-    row.querySelectorAll('.btn-ts-del,.btn-ts-file').forEach(b=>b.classList.remove('active'));
-    if (type==='delete'){const b=row.querySelector('.btn-ts-del');if(b)b.classList.add('active');}
-    else if (type==='file'){const b=row.querySelector('.btn-ts-file');if(b)b.classList.add('active');}
-    // Rebuild clear button
-    const btns = row.querySelector('.triage-btns');
-    if (btns) {
-      let clr = btns.querySelector('.btn-ts-clr');
-      if (type && !clr) {
-        const b=document.createElement('button');b.className='btn btn-ghost btn-sm btn-ts-clr';
-        b.textContent='✕';b.onclick=()=>triageMark(convKey,null);
-        btns.insertBefore(b, btns.querySelector('.triage-qlbl'));
-      } else if (!type && clr) clr.remove();
-    }
-  }
-  const queuedCount = Object.keys(state.triageActions).length;
-  const countEl = document.getElementById('triage-queue-count');
-  if (countEl) countEl.textContent = queuedCount+' queued';
-  const execBtn = document.getElementById('triage-execute-btn');
-  if (execBtn) execBtn.disabled = queuedCount === 0;
+async function triageDeleteNow(convKey) {
+  const thread = state.threadMap[convKey];
+  if (!thread) return;
+  await _act('/api/delete', {ids: thread.emailIds, conversationKey: convKey}, convKey);
+  openTriageSheet();
 }
 
-async function executeAllActions() {
-  const entries = Object.entries(state.triageActions);
-  if (!entries.length) return;
-  const execBtn = document.getElementById('triage-execute-btn');
-  let done = 0;
-  const total = entries.length;
-  for (const [convKey, action] of entries) {
-    if (execBtn) execBtn.textContent = `Executing ${done+1}/${total}...`;
-    const thread = state.threadMap[convKey];
-    if (!thread) { done++; continue; }
-    try {
-      if (action.type === 'send') {
-        // Open reply modal for this thread so user can compose
-        closeTriageSheet();
-        selectThread(convKey);
-        const enc = encodeThread(thread);
-        setTimeout(()=>openReply(enc), 400);
-        break; // handle one reply at a time
-      } else if (action.type === 'delete') {
-        await fetch('/api/delete', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ids: thread.emailIds, conversationKey: convKey})
-        });
-      } else if (action.type === 'file') {
-        await fetch('/api/move', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ids: thread.emailIds, folder: thread.suggestedFolder||'', conversationKey: convKey})
-        });
-      }
-    } catch(e) {
-      console.error('Execute action error for '+convKey, e);
-    }
-    // Mark row as done
-    const row = document.getElementById('triage-row-'+convKey);
-    if (row) {
-      row.className = 'triage-row ts-done';
-      const qlbl = row.querySelector('.triage-qlbl');
-      if (qlbl) qlbl.textContent = '✓ Done';
-    }
-    // Remove from state
-    delete state.triageActions[convKey];
-    delete state.threadMap[convKey];
-    for (const g of state.groups) g.threads = g.threads.filter(t=>t.conversationKey!==convKey);
-    state.groups = state.groups.filter(g=>g.threads.length>0);
-    done++;
+function showTriageMsgJson(convKey, idx) {
+  const msgs = state.triageMsgCache[convKey] || [];
+  const m = msgs[idx];
+  if (!m) return;
+  const overlay = document.getElementById('json-debug-overlay');
+  const pre = document.getElementById('json-debug-content');
+  if (!overlay || !pre) return;
+  let obj = m;
+  if (m.raw_json) {
+    try { obj = JSON.parse(m.raw_json); } catch(e) { obj = m; }
   }
-  renderSidebar();
-  updateCounts(null, Object.keys(state.threadMap).length);
-  // Re-render triage sheet so completed items are removed
-  renderTriageSheet();
-  const execBtn2 = document.getElementById('triage-execute-btn');
-  if (execBtn2) { execBtn2.textContent = `✓ ${done} action${done!==1?'s':''} done`; execBtn2.disabled = true; }
+  pre.textContent = JSON.stringify(obj, null, 2);
+  overlay.classList.add('open');
+}
+
+function triageFileNow(convKey) {
+  const thread = state.threadMap[convKey];
+  if (!thread) return;
+  state.returnToTriage = true;
+  openFile(encodeThread(thread));
 }

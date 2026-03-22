@@ -63,3 +63,13 @@
 /* OWA link */
 .msg-owa-link{font-size:13px;color:#5a7a9e;text-decoration:none;flex-shrink:0;margin-left:2px;opacity:.7;transition:opacity .15s;}
 .msg-owa-link:hover{opacity:1;color:#58a6ff;}
+/* JSON debug link */
+.msg-json-link{font-size:11px;color:#5a7a9e;text-decoration:none;flex-shrink:0;margin-left:2px;opacity:.6;transition:opacity .15s;font-family:monospace;font-weight:700;}
+.msg-json-link:hover{opacity:1;color:#58a6ff;}
+/* Triage row recipients */
+.triage-row-recips{font-size:10px;color:#6a8baa;line-height:1.4;padding:0 0 2px 17px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.triage-row-recips .msg-recip-lbl{font-weight:700;color:#5ba4cf;margin-right:3px;}
+.triage-recip-list{color:#6a8baa;}
+/* Triage view button */
+.btn-xs{font-size:9px;padding:1px 6px;border-radius:6px;min-height:auto;line-height:1.4;}
+.triage-view-btn{flex-shrink:0;}

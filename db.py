@@ -80,6 +80,13 @@ def init_db():
     """)
     db.commit()
     # Migrations: add columns if not present (idempotent)
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS email_embeddings (
+            email_id    TEXT PRIMARY KEY,
+            embedding   BLOB NOT NULL
+        );
+    """)
+    db.commit()
     for migration in [
         "ALTER TABLE emails ADD COLUMN formatted_body TEXT",
         "ALTER TABLE threads ADD COLUMN is_flagged INTEGER DEFAULT 0",

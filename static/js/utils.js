@@ -9,6 +9,57 @@ function initials(name) {
   return p.length>=2?(p[0][0]+p[1][0]).toUpperCase():(p[0]||'?').slice(0,2).toUpperCase();
 }
 
+// ── Profile image cache & helpers ─────────────────────────────────────────────
+const _profileImageCache = {}; // email -> 'ok' | 'fail' | 'pending'
+
+function avatarHTML(name, email, size, extraStyle) {
+  const sz = size || 20;
+  const fs = Math.max(7, Math.round(sz * 0.4));
+  const baseStyle = `background:${avColor(name)};width:${sz}px;height:${sz}px;font-size:${fs}px;border:2px solid #0a1628;flex-shrink:0`;
+  const style = extraStyle ? baseStyle + ';' + extraStyle : baseStyle;
+  const emailAttr = email ? ` data-av-email="${esc(email.toLowerCase())}"` : '';
+  return `<span class="avatar" style="${style}"${emailAttr}>${initials(name)}</span>`;
+}
+
+function loadProfileImages(emails) {
+  if (!emails || !emails.length) return;
+  const toFetch = [];
+  for (const e of emails) {
+    const key = e.toLowerCase();
+    if (_profileImageCache[key]) {
+      if (_profileImageCache[key] !== 'pending' && _profileImageCache[key] !== 'fail') _applyAvatar(key, _profileImageCache[key]);
+      continue;
+    }
+    _profileImageCache[key] = 'pending';
+    toFetch.push(key);
+  }
+  if (!toFetch.length) return;
+  fetch('/api/profile_images', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({emails:toFetch})})
+    .then(r=>r.json())
+    .then(d => {
+      const images = d.images || {};
+      for (const [e, uri] of Object.entries(images)) {
+        const key = e.toLowerCase();
+        _profileImageCache[key] = uri || 'fail';
+        if (uri) _applyAvatar(key, uri);
+      }
+      for (const e of toFetch) if (_profileImageCache[e] === 'pending') _profileImageCache[e] = 'fail';
+    })
+    .catch(() => { for (const e of toFetch) _profileImageCache[e] = 'fail'; });
+}
+
+function _applyAvatar(key, dataUri) {
+  document.querySelectorAll(`[data-av-email="${CSS.escape(key)}"]`).forEach(el => {
+    if (!el.dataset.avLoaded) {
+      el.dataset.avLoaded = '1';
+      el.innerHTML = '';
+      el.style.backgroundImage = `url(${dataUri})`;
+      el.style.backgroundSize = 'cover';
+      el.style.backgroundPosition = 'center';
+    }
+  });
+}
+
 function esc(s) {
   return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }

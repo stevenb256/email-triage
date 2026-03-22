@@ -213,9 +213,12 @@ async function loadTopContacts() {
   list.innerHTML = r.contacts.map(c => {
     const name = c.name || c.email;
     return `<div class="top-contact-row" title="${esc(c.email)}">
-      <span class="top-contact-av" style="background:${avColor(name)}">${initials(name)}</span>
+      <span class="top-contact-av" style="background:${avColor(name)}" data-av-email="${esc(c.email.toLowerCase())}">${initials(name)}</span>
       <span class="top-contact-name">${esc(name)}</span>
       <span class="top-contact-freq">${c.frequency}</span>
     </div>`;
   }).join('');
+  // Load profile images for top contacts
+  const contactEmails = r.contacts.map(c=>c.email).filter(Boolean);
+  if (contactEmails.length) loadProfileImages(contactEmails);
 }

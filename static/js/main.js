@@ -10,8 +10,8 @@ let state = {
   folders: [],
   effortsFolders: [],
   pollTimer: null,
-  triageActions: {},      // map of conversationKey → {type: 'send'|'delete'|'file', reply: string}
   triageView: false,
+  returnToTriage: false,  // when true, closing any modal returns to triage view
   mailboxContext: false,  // true when thread opened from mailbox view
   collapsedTriageTopics: new Set(),
   triageFocusIdx: -1,
@@ -19,6 +19,10 @@ let state = {
   triageMsgCache: {},
   triageExpandedMsgs: {}, // convKey → Set of expanded msg indices
   triageMsgSummaries: {}, // msgId → summary string (or '' if done, null if pending)
+  formatCache: {},        // msgId → paragraphs array (AI format)
+  showOriginal: {},       // msgId → bool (true = show original HTML, false = smart view)
+  rewriteCache: {},       // msgId → rewritten HTML string
+  rewriteInFlight: {},    // msgId → bool (true = streaming in progress)
 };
 let _activeThread = null;
 let MY_EMAIL = '';
@@ -171,6 +175,42 @@ function showToast(msg, isError=false) {
     document.body.style.cursor='';document.body.style.userSelect='';
   });
 })();
+
+// ── Token refresh ───────────────────────────────────────────────────────────────
+async function refreshToken(login) {
+  const btn = document.getElementById('refresh-token-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '🔑…'; }
+  showToast(login ? 'Opening Edge for login…' : 'Refreshing Outlook token…');
+  try {
+    const body = login ? {login:true} : {force:true};
+    const r = await fetch('/api/refresh_token', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r=>r.json());
+    if (r.ok) {
+      showToast(r.skipped ? 'Token still fresh' : `Token refreshed (${(r.ports_submitted||[]).length} MCP processes)`);
+    } else {
+      // If headless failed, offer login
+      if (!login && (r.error||'').includes('login')) {
+        showToast('Need login — opening Edge…');
+        return refreshToken(true);
+      }
+      showToast(r.error || 'Token refresh failed', true);
+    }
+  } catch(e) {
+    showToast('Token refresh error: ' + e.message, true);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🔑'; }
+  }
+}
+
+// Check token health periodically (every 10 min)
+setInterval(async () => {
+  try {
+    const r = await fetch('/api/token_status').then(r=>r.json());
+    if (r.needs_refresh) {
+      console.log('[token] Token expiring, auto-refreshing…');
+      refreshToken();
+    }
+  } catch(e) {}
+}, 600000);
 
 // ── Modal overlay close on background click ────────────────────────────────────
 document.querySelectorAll('.modal-overlay').forEach(m=>
